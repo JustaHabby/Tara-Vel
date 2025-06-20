@@ -1,0 +1,67 @@
+{
+  "project_info": {
+    "project_number": "909856827947",
+    "project_id": "tara-vel-prototype",
+    "storage_bucket": "tara-vel-prototype.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:909856827947:android:c444cedc54167e568f986e",
+        "android_client_info": {
+          "package_name": "com.example.myapplication"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyDyNkeA7il99yjMVAbT9_Tus5N5INr0ExU"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    },
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:909856827947:android:e916bb2d1c3f69468f986e",
+        "android_client_info": {
+          "package_name": "com.example.tara_velprototype"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyDyNkeA7il99yjMVAbT9_Tus5N5INr0ExU"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    },
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:909856827947:android:3b051366bd2171298f986e",
+        "android_client_info": {
+          "package_name": "com.example.tara_velprototypesystem"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyDyNkeA7il99yjMVAbT9_Tus5N5INr0ExU"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}
