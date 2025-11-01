@@ -12,23 +12,23 @@ const io = new Server(server, {
 const drivers = {};
 
 io.on("connection", (socket) => {
-  console.log(`✅ A client connected: ${socket.id}`);
+  console.log(`A client connected: ${socket.id}`);
 
   // ROLE REGISTRATION
   socket.on("registerRole", (role) => {
     if (role === "user" || role === "driver") {
       socket.role = role;
       socket.join(role);
-      console.log(`🆔 ${socket.id} registered as ${role}`);
+      console.log(`${socket.id} registered as ${role}`);
     } else {
-      console.log(`⚠️ Unknown role from ${socket.id}: ${role}`);
+      console.log(`Unknown role from ${socket.id}: ${role}`);
     }
   });
 
   // LOCATION UPDATES (includes accountId, destination)
   socket.on("updateLocation", (data) => {
     // data: { lat, lng, destinationLat, destinationLng, accountId }
-    console.log(`📍 Location from ${socket.role} (${data.accountId}):`, data);
+    console.log(`Location from ${socket.role} (${data.accountId}):`, data);
 
     if (socket.role === "driver") {
       // Update driver location in memory
@@ -60,7 +60,7 @@ io.on("connection", (socket) => {
   // ROUTE UPDATE (driver → users)
   socket.on("routeUpdate", (data) => {
     // data: { accountId, geometry, destinationLat, destinationLng }
-    console.log("🛣️ Route data received from driver:", data);
+    console.log("Route data received from driver:", data);
 
     // Store route in memory
     if (data.accountId) {
@@ -81,11 +81,11 @@ io.on("connection", (socket) => {
     });
   });
 
-  // 🧍 PASSENGER COUNT UPDATES (driver → users)
+  // PASSENGER COUNT UPDATES (driver → users)
   socket.on("passengerUpdate", (data) => {
     const { accountId, passengerCount, maxCapacity } = data;
     console.log(
-      `🧍 Passenger update from driver ${accountId}: ${passengerCount}/${maxCapacity}`
+      `Passenger update from driver ${accountId}: ${passengerCount}/${maxCapacity}`
     );
 
     // Store latest passenger count AND maxCapacity per driver
@@ -107,9 +107,9 @@ io.on("connection", (socket) => {
     });
   });
 
-  // 🆕 GET ALL ACTIVE DRIVERS (for new users connecting)
+  // GET ALL ACTIVE DRIVERS (for new users connecting)
   socket.on("requestDriversData", () => {
-    console.log(`📋 User ${socket.id} requested all active drivers data`);
+    console.log(`User ${socket.id} requested all active drivers data`);
 
     // Send current state of all drivers
     socket.emit("driversData", {
@@ -122,7 +122,7 @@ io.on("connection", (socket) => {
 
   // DISCONNECT HANDLER
   socket.on("disconnect", () => {
-    console.log(`❌ Client disconnected: ${socket.id} (${socket.role || "unknown"})`);
+    console.log(`Client disconnected: ${socket.id} (${socket.role || "unknown"})`);
 
     // Optional: remove driver from active list after disconnect
     // You may add a delay or keep them in memory temporarily
@@ -132,5 +132,5 @@ io.on("connection", (socket) => {
 // Start the server
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, () => {
-  console.log(`🚀 Server running on port ${PORT}`);
+  console.log(`Server running on port ${PORT}`);
 });
