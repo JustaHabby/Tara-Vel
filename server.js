@@ -25,10 +25,10 @@ io.on("connection", (socket) => {
     }
   });
 
-  // LOCATION UPDATES (includes accountId, destination, organization)
+  // LOCATION UPDATES (includes accountId, destination, organization, capacity, profile image)
   socket.on("updateLocation", (data) => {
-    // data: { lat, lng, destinationLat, destinationLng, accountId, organizationName }
-    console.log(`📍 Location from ${socket.role} (${data.accountId} - ${data.organizationName}):`, data);
+    // data: { lat, lng, destinationLat, destinationLng, destinationName, accountId, organizationName, maxCapacity, passengerCount, profileImageUrl }
+    console.log(`📍 Location from ${socket.role} (${data.accountId} - ${data.organizationName}) → ${data.destinationName} [${data.passengerCount}/${data.maxCapacity}]:`, data);
 
     if (socket.role === "driver") {
       // Update driver location in memory
@@ -39,7 +39,11 @@ io.on("connection", (socket) => {
           lng: data.lng,
           destinationLat: data.destinationLat,
           destinationLng: data.destinationLng,
+          destinationName: data.destinationName || "Unknown", // 🎯 Store destination name
           organizationName: data.organizationName || "No Organization", // 🏢 Store organization
+          maxCapacity: data.maxCapacity || 0, // 🚌 Store capacity
+          passengerCount: data.passengerCount || 0, // 🧍 Store passenger count
+          profileImageUrl: data.profileImageUrl || "", // 🖼️ Store profile image URL
           lastUpdated: new Date().toISOString(),
         };
       }
@@ -49,7 +53,11 @@ io.on("connection", (socket) => {
         ...data,
         from: "driver",
         accountId: data.accountId,
+        destinationName: data.destinationName || "Unknown", // 🎯 Broadcast destination name
         organizationName: data.organizationName || "No Organization", // 🏢 Broadcast organization
+        maxCapacity: data.maxCapacity || 0, // 🚌 Broadcast capacity
+        passengerCount: data.passengerCount || 0, // 🧍 Broadcast passenger count
+        profileImageUrl: data.profileImageUrl || "", // 🖼️ Broadcast profile image URL
       });
     } else if (socket.role === "user") {
       io.to("driver").emit("userLocation", {
@@ -61,8 +69,8 @@ io.on("connection", (socket) => {
 
   // ROUTE UPDATE (driver → users)
   socket.on("routeUpdate", (data) => {
-    // data: { accountId, geometry, destinationLat, destinationLng }
-    console.log("🛣️ Route data received from driver:", data);
+    // data: { accountId, geometry, destinationLat, destinationLng, destinationName }
+    console.log(`🛣️ Route data received from driver ${data.accountId} → ${data.destinationName}:`, data);
 
     // Store route in memory
     if (data.accountId) {
@@ -71,6 +79,7 @@ io.on("connection", (socket) => {
         geometry: data.geometry,
         destinationLat: data.destinationLat,
         destinationLng: data.destinationLng,
+        destinationName: data.destinationName || "Unknown", // 🎯 Store destination name
         lastUpdated: new Date().toISOString(),
       };
     }
@@ -107,6 +116,58 @@ io.on("connection", (socket) => {
       passengerCount,
       maxCapacity,
       organizationName: organizationName || "No Organization", // 🏢 Broadcast organization
+      from: "driver",
+    });
+  });
+
+  // 🎯 DESTINATION UPDATE (driver → users)
+  socket.on("destinationUpdate", (data) => {
+    const { accountId, destinationName, destinationLat, destinationLng } = data;
+    console.log(
+      `🎯 Destination update from driver ${accountId}: ${destinationName} (${destinationLat}, ${destinationLng})`
+    );
+
+    // Store destination info per driver
+    if (accountId) {
+      drivers[accountId] = {
+        ...drivers[accountId],
+        destinationName: destinationName || "Unknown",
+        destinationLat,
+        destinationLng,
+        lastUpdated: new Date().toISOString(),
+      };
+    }
+
+    // Broadcast destination info to all connected users
+    io.to("user").emit("destinationUpdate", {
+      accountId,
+      destinationName: destinationName || "Unknown",
+      destinationLat,
+      destinationLng,
+      from: "driver",
+    });
+  });
+
+  // 🖼️ PROFILE IMAGE UPDATE (driver → users)
+  socket.on("profileImageUpdate", (data) => {
+    const { accountId, profileImageUrl } = data;
+    console.log(
+      `🖼️ Profile image update from driver ${accountId}: ${profileImageUrl}`
+    );
+
+    // Store profile image URL per driver
+    if (accountId) {
+      drivers[accountId] = {
+        ...drivers[accountId],
+        profileImageUrl: profileImageUrl || "",
+        lastUpdated: new Date().toISOString(),
+      };
+    }
+
+    // Broadcast profile image URL to all connected users
+    io.to("user").emit("profileImageUpdate", {
+      accountId,
+      profileImageUrl: profileImageUrl || "",
       from: "driver",
     });
   });
