@@ -101,9 +101,21 @@ io.on("connection", (socket) => {
     });
   });
 
-  // 🧍 PASSENGER COUNT UPDATES (removed)
-  socket.on("passengerUpdate", () => {
-    // No-op: passengerCount is no longer processed server-side
+  // 🧍 PASSENGER COUNT UPDATES (removed passengerCount processing)
+  socket.on("passengerUpdate", (data) => {
+    const { accountId, organizationName } = data;
+    console.log(`🧍 Passenger update received from driver ${accountId} (count ignored)`);
+
+    // Optionally refresh organization name only; do not store passenger counts
+    if (accountId) {
+      drivers[accountId] = {
+        ...drivers[accountId],
+        organizationName: organizationName || drivers[accountId]?.organizationName || "No Organization",
+        lastUpdated: new Date().toISOString(),
+      };
+    }
+
+    // Do not broadcast passenger counts anymore
   });
 
   // 🎯 DESTINATION UPDATE (driver → users)
