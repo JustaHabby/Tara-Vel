@@ -6,8 +6,6 @@ const app = express();
 const server = http.createServer(app);
 const io = new Server(server, {
   cors: { origin: "*" },
-  allowEIO3: true, // enable compatibility with Socket.IO v2 clients
-  transports: ["websocket", "polling"],
 });
 
 // In-memory data store for active drivers
@@ -27,9 +25,9 @@ io.on("connection", (socket) => {
     }
   });
 
-  // LOCATION UPDATES (includes accountId, destination, organization, profile image)
+  // LOCATION UPDATES (includes accountId, destination, organization, passenger count, profile image)
   socket.on("updateLocation", (data) => {
-    // data: { lat, lng, destinationLat, destinationLng, destinationName, accountId, organizationName, profileImageUrl }
+    // data: { lat, lng, destinationLat, destinationLng, destinationName, accountId, organizationName, passengerCount, profileImageUrl }
     const filtered = {
       accountId: data.accountId,
       organizationName: data.organizationName,
@@ -38,9 +36,10 @@ io.on("connection", (socket) => {
       destinationLng: data.destinationLng,
       lat: data.lat,
       lng: data.lng,
+      passengerCount: data.passengerCount,
       profileImageUrl: data.profileImageUrl,
     };
-    console.log(`📍 Location from ${socket.role} (${filtered.accountId} - ${filtered.organizationName}) → ${filtered.destinationName}:`, filtered);
+    console.log(`📍 Location from ${socket.role} (${filtered.accountId} - ${filtered.organizationName}) → ${filtered.destinationName} [passengers: ${filtered.passengerCount}]:`, filtered);
 
     if (socket.role === "driver") {
       // Update driver location in memory
@@ -53,6 +52,7 @@ io.on("connection", (socket) => {
           destinationLng: data.destinationLng,
           destinationName: data.destinationName || "Unknown", // 🎯 Store destination name
           organizationName: data.organizationName || "No Organization", // 🏢 Store organization
+          passengerCount: data.passengerCount || 0, // 🧍 Store passenger count
           profileImageUrl: data.profileImageUrl || "", // 🖼️ Store profile image URL
           lastUpdated: new Date().toISOString(),
         };
@@ -68,6 +68,7 @@ io.on("connection", (socket) => {
         organizationName: filtered.organizationName || "No Organization",
         lat: filtered.lat,
         lng: filtered.lng,
+        passengerCount: filtered.passengerCount || 0,
         profileImageUrl: filtered.profileImageUrl || "",
       });
     } else if (socket.role === "user") {
@@ -103,21 +104,30 @@ io.on("connection", (socket) => {
     });
   });
 
-  // 🧍 PASSENGER COUNT UPDATES (removed passengerCount processing)
+  // 🧍 PASSENGER COUNT UPDATES (driver → users)
   socket.on("passengerUpdate", (data) => {
-    const { accountId, organizationName } = data;
-    console.log(`🧍 Passenger update received from driver ${accountId} (count ignored)`);
+    const { accountId, passengerCount, organizationName } = data;
+    console.log(
+      `🧍 Passenger update from driver ${accountId} (${organizationName}): ${passengerCount}`
+    );
 
-    // Optionally refresh organization name only; do not store passenger counts
+    // Store latest passenger count, maxCapacity, AND organization info per driver
     if (accountId) {
       drivers[accountId] = {
         ...drivers[accountId],
-        organizationName: organizationName || drivers[accountId]?.organizationName || "No Organization",
+        passengerCount,
+        organizationName: organizationName || "No Organization", // 🏢 Store organization
         lastUpdated: new Date().toISOString(),
       };
     }
 
-    // Do not broadcast passenger counts anymore
+    // Broadcast passenger count, maxCapacity, AND organization info to all connected users
+    io.to("user").emit("passengerCountUpdate", {
+      accountId,
+      passengerCount,
+      organizationName: organizationName || "No Organization", // 🏢 Broadcast organization
+      from: "driver",
+    });
   });
 
   // 🎯 DESTINATION UPDATE (driver → users)
