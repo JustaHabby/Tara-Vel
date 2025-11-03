@@ -6,6 +6,8 @@ const app = express();
 const server = http.createServer(app);
 const io = new Server(server, {
   cors: { origin: "*" },
+  allowEIO3: true, // enable compatibility with Socket.IO v2 clients
+  transports: ["websocket", "polling"],
 });
 
 // In-memory data store for active drivers
