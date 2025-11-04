@@ -1,3 +1,6 @@
+// ===============================
+// 🚌 Real-Time Bus Tracking Server
+// ===============================
 const express = require("express");
 const http = require("http");
 const { Server } = require("socket.io");
@@ -5,16 +8,22 @@ const { Server } = require("socket.io");
 const app = express();
 const server = http.createServer(app);
 const io = new Server(server, {
-  cors: { origin: "*" },
+  cors: { origin: "*" }, // Allow all origins for dev/testing
 });
 
-// In-memory data store for active drivers
+// In-memory store for active drivers
 const drivers = {};
 
+// Root route (for quick check if server is alive)
+app.get("/", (req, res) => {
+  res.send("🟢 TaraVel Realtime Server is running!");
+});
+
+// ========== SOCKET.IO HANDLERS ==========
 io.on("connection", (socket) => {
   console.log("✅ A client connected:", socket.id);
 
-  // ROLE REGISTRATION
+  // --- ROLE REGISTRATION ---
   socket.on("registerRole", (role) => {
     if (role === "user" || role === "driver") {
       socket.role = role;
@@ -25,171 +34,142 @@ io.on("connection", (socket) => {
     }
   });
 
-  // LOCATION UPDATES (includes accountId, destination, organization)
+  // --- LOCATION UPDATES ---
   socket.on("updateLocation", (data) => {
-    // data: { lat, lng, destinationLat, destinationLng, destinationName, accountId, organizationName }
-    // Force-drop any profile image field if a client still sends it
-    if (Object.prototype.hasOwnProperty.call(data, "profileImageUrl")) {
-      delete data.profileImageUrl;
-    }
+    // Expect: { lat, lng, destinationLat, destinationLng, destinationName, accountId, organizationName }
+    if (!data?.accountId) return;
+
     const filtered = {
       accountId: data.accountId,
-      organizationName: data.organizationName,
-      destinationName: data.destinationName,
+      organizationName: data.organizationName || "No Organization",
+      destinationName: data.destinationName || "Unknown",
       destinationLat: data.destinationLat,
       destinationLng: data.destinationLng,
       lat: data.lat,
       lng: data.lng,
     };
-    console.log(`📍 Location from ${socket.role} (${filtered.accountId} - ${filtered.organizationName}) → ${filtered.destinationName}:`, filtered);
 
     if (socket.role === "driver") {
-      // Update driver location in memory
-      if (data.accountId) {
-        drivers[data.accountId] = {
-          ...drivers[data.accountId],
-          lat: data.lat,
-          lng: data.lng,
-          destinationLat: data.destinationLat,
-          destinationLng: data.destinationLng,
-          destinationName: data.destinationName || "Unknown", // 🎯 Store destination name
-          organizationName: data.organizationName || "No Organization", // 🏢 Store organization
-          lastUpdated: new Date().toISOString(),
-        };
-        // Ensure legacy profileImageUrl is purged from memory
-        if (Object.prototype.hasOwnProperty.call(drivers[data.accountId], "profileImageUrl")) {
-          delete drivers[data.accountId].profileImageUrl;
-        }
-      }
+      // Save to memory
+      drivers[data.accountId] = {
+        ...drivers[data.accountId],
+        ...filtered,
+        lastUpdated: new Date().toISOString(),
+      };
 
-      // Broadcast to all users
+      // Broadcast to users
       io.to("user").emit("locationUpdate", {
         from: "driver",
-        accountId: filtered.accountId,
-        destinationName: filtered.destinationName || "Unknown",
-        destinationLat: filtered.destinationLat,
-        destinationLng: filtered.destinationLng,
-        organizationName: filtered.organizationName || "No Organization",
-        lat: filtered.lat,
-        lng: filtered.lng,
+        ...filtered,
       });
     } else if (socket.role === "user") {
       io.to("driver").emit("userLocation", {
-        ...data,
         from: "user",
+        ...filtered,
       });
     }
   });
 
-  // ROUTE UPDATE (driver → users)
+  // --- ROUTE UPDATE (driver → users) ---
   socket.on("routeUpdate", (data) => {
-    // data: { accountId, geometry, destinationLat, destinationLng, destinationName }
-    console.log(`🛣️ Route data received from driver ${data.accountId} → ${data.destinationName}:`, data);
+    if (!data?.accountId) return;
+    console.log(`🛣️ Route data received from driver ${data.accountId}`);
 
-    // Store route in memory
-    if (data.accountId) {
-      drivers[data.accountId] = {
-        ...drivers[data.accountId],
-        geometry: data.geometry,
-        destinationLat: data.destinationLat,
-        destinationLng: data.destinationLng,
-        destinationName: data.destinationName || "Unknown", // 🎯 Store destination name
-        lastUpdated: new Date().toISOString(),
-      };
-    }
+    drivers[data.accountId] = {
+      ...drivers[data.accountId],
+      geometry: data.geometry,
+      destinationLat: data.destinationLat,
+      destinationLng: data.destinationLng,
+      destinationName: data.destinationName || "Unknown",
+      lastUpdated: new Date().toISOString(),
+    };
 
-    // Broadcast route geometry to all users
     io.to("user").emit("routeUpdate", {
-      ...data,
       from: "driver",
-      accountId: data.accountId,
+      ...data,
     });
   });
 
-  // 🧍 PASSENGER COUNT UPDATES (driver → users)
+  // --- PASSENGER COUNT UPDATES ---
   socket.on("passengerUpdate", (data) => {
     const { accountId, passengerCount, maxCapacity, organizationName } = data || {};
-    console.log(
-      `🧍 Passenger update from driver ${accountId} (${organizationName || "No Organization"}): ${passengerCount}/${maxCapacity}`
-    );
+    if (!accountId) return;
 
-    if (accountId) {
-      const prev = drivers[accountId] || {};
-      const resolvedOrg = organizationName || prev.organizationName || "No Organization";
-      const resolvedMax = typeof maxCapacity === "number" ? maxCapacity : (prev.maxCapacity || 0);
-      const resolvedCount = typeof passengerCount === "number" ? passengerCount : (prev.passengerCount || 0);
+    const prev = drivers[accountId] || {};
+    drivers[accountId] = {
+      ...prev,
+      passengerCount: passengerCount ?? prev.passengerCount ?? 0,
+      maxCapacity: maxCapacity ?? prev.maxCapacity ?? 0,
+      organizationName: organizationName || prev.organizationName || "No Organization",
+      lastUpdated: new Date().toISOString(),
+    };
 
-      drivers[accountId] = {
-        ...prev,
-        passengerCount: resolvedCount,
-        maxCapacity: resolvedMax,
-        organizationName: resolvedOrg,
-        lastUpdated: new Date().toISOString(),
-      };
-
-      // Broadcast latest passenger count to all connected users
-      io.to("user").emit("passengerCountUpdate", {
-        accountId,
-        passengerCount: drivers[accountId].passengerCount,
-        maxCapacity: drivers[accountId].maxCapacity,
-        organizationName: drivers[accountId].organizationName,
-        from: "driver",
-      });
-    }
+    io.to("user").emit("passengerCountUpdate", {
+      from: "driver",
+      accountId,
+      passengerCount: drivers[accountId].passengerCount,
+      maxCapacity: drivers[accountId].maxCapacity,
+      organizationName: drivers[accountId].organizationName,
+    });
   });
 
-  // 🎯 DESTINATION UPDATE (driver → users)
+  // --- DESTINATION UPDATE ---
   socket.on("destinationUpdate", (data) => {
-    const { accountId, destinationName, destinationLat, destinationLng } = data;
-    console.log(
-      `🎯 Destination update from driver ${accountId}: ${destinationName} (${destinationLat}, ${destinationLng})`
-    );
+    const { accountId, destinationName, destinationLat, destinationLng } = data || {};
+    if (!accountId) return;
 
-    // Store destination info per driver
-    if (accountId) {
-      drivers[accountId] = {
-        ...drivers[accountId],
-        destinationName: destinationName || "Unknown",
-        destinationLat,
-        destinationLng,
-        lastUpdated: new Date().toISOString(),
-      };
-    }
-
-    // Broadcast destination info to all connected users
-    io.to("user").emit("destinationUpdate", {
-      accountId,
+    drivers[accountId] = {
+      ...drivers[accountId],
       destinationName: destinationName || "Unknown",
       destinationLat,
       destinationLng,
+      lastUpdated: new Date().toISOString(),
+    };
+
+    io.to("user").emit("destinationUpdate", {
       from: "driver",
+      accountId,
+      destinationName,
+      destinationLat,
+      destinationLng,
     });
   });
 
-  // (profile image update handling removed)
+  // --- NEW FEATURE: GET BUS INFO (user → server → user) ---
+  socket.on("getBusInfo", (data) => {
+    const { accountId } = data || {};
+    if (!accountId) return socket.emit("busInfoError", { message: "Missing accountId" });
 
-  // 🆕 GET ALL ACTIVE DRIVERS (for new users connecting)
+    const busData = drivers[accountId];
+    if (busData) {
+      console.log(`ℹ️ Bus info requested for ${accountId}`);
+      socket.emit("busInfo", {
+        accountId,
+        ...busData,
+        from: "server",
+      });
+    } else {
+      socket.emit("busInfoError", { message: "Bus not found or inactive" });
+    }
+  });
+
+  // --- NEW USERS REQUEST ALL ACTIVE DRIVERS ---
   socket.on("requestDriversData", () => {
-    console.log(`📋 User ${socket.id} requested all active drivers data`);
-    
-    // Send current state of all drivers
+    console.log(`📋 ${socket.id} requested active drivers`);
     socket.emit("driversData", {
-      drivers: Object.entries(drivers).map(([accountId, data]) => {
-        const { profileImageUrl, ...rest } = data || {};
-        return { accountId, ...rest };
-      }),
+      drivers: Object.entries(drivers).map(([accountId, data]) => ({
+        accountId,
+        ...data,
+      })),
     });
   });
 
-  // DISCONNECT HANDLER
+  // --- DISCONNECT HANDLER ---
   socket.on("disconnect", () => {
-    console.log(
-      `❌ Client disconnected: ${socket.id} (${socket.role || "unknown"})`
-    );
-    
-    // Optional: Remove driver from active list after disconnect
-    // (You might want to add a timeout instead of immediate removal)
+    console.log(`❌ Disconnected: ${socket.id} (${socket.role || "unknown"})`);
   });
 });
 
-server.listen(3000, () => console.log("✅ Server running on port 3000"));
+// Use PORT from hosting service or 3000 locally
+const PORT = process.env.PORT || 3000;
+server.listen(PORT, () => console.log(`✅ Server running on port ${PORT}`));
