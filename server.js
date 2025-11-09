@@ -117,6 +117,45 @@ io.on("connection", (socket) => {
     console.log(`🎯 [${accountId}] Destination updated: (${destinationLat}, ${destinationLng})`);
   });
 
+// --- ROUTE UPDATE (Driver → Server → Users) ---
+socket.on("routeUpdate", (data) => {
+  /**
+   * Expect:
+   * {
+   *   accountId,
+   *   geometry, // encoded polyline string
+   *   destinationLat,
+   *   destinationLng
+   * }
+   */
+  if (!data?.accountId) return;
+
+  const { accountId, geometry, destinationLat, destinationLng } = data;
+
+  // Store route info in memory
+  drivers[accountId] = {
+    ...drivers[accountId],
+    accountId,
+    geometry, // encoded polyline string
+    destinationLat,
+    destinationLng,
+    lastUpdated: new Date().toISOString(),
+  };
+
+  // Broadcast route geometry to users (for displaying route on map)
+  io.to("user").emit("routeUpdate", {
+    from: "driver",
+    accountId,
+    geometry,
+    destinationLat,
+    destinationLng,
+  });
+
+  console.log(
+    `🗺️ [${accountId}] Sent routeUpdate with encoded polyline + destination (${destinationLat}, ${destinationLng})`
+  );
+});
+
   // --- PASSENGER COUNT UPDATE (Driver → Server Only) ---
   socket.on("passengerUpdate", (data) => {
     const { accountId, passengerCount, maxCapacity } = data || {};
