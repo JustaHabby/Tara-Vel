@@ -1,5 +1,5 @@
 // ===============================
-// 🚌 Real-Time Bus Tracking Server
+// 🚌 Real-Time Bus Tracking Server (Relay + On-Demand Info)
 // ===============================
 const express = require("express");
 const http = require("http");
@@ -34,86 +34,66 @@ io.on("connection", (socket) => {
     }
   });
 
-  // --- LOCATION UPDATES ---
+  // --- LOCATION UPDATES (Driver → Server → Users) ---
   socket.on("updateLocation", (data) => {
-    // Expect: { lat, lng, destinationLat, destinationLng, destinationName, accountId, organizationName }
+    /**
+     * Expect:
+     * {
+     *   accountId,
+     *   organizationName,
+     *   destinationName,
+     *   destinationLat,
+     *   destinationLng,
+     *   lat,
+     *   lng,
+     *   passengerCount,
+     *   maxCapacity
+     * }
+     */
     if (!data?.accountId) return;
+    const {
+      accountId,
+      organizationName,
+      destinationName,
+      destinationLat,
+      destinationLng,
+      lat,
+      lng,
+      passengerCount,
+      maxCapacity,
+    } = data;
 
-    const filtered = {
-      accountId: data.accountId,
-      organizationName: data.organizationName || "No Organization",
-      destinationName: data.destinationName || "Unknown",
-      destinationLat: data.destinationLat,
-      destinationLng: data.destinationLng,
-      lat: data.lat,
-      lng: data.lng,
-    };
-
-    if (socket.role === "driver") {
-      // Save to memory
-      drivers[data.accountId] = {
-        ...drivers[data.accountId],
-        ...filtered,
-        lastUpdated: new Date().toISOString(),
-      };
-
-      // Broadcast to users
-      io.to("user").emit("locationUpdate", {
-        from: "driver",
-        ...filtered,
-      });
-    } else if (socket.role === "user") {
-      io.to("driver").emit("userLocation", {
-        from: "user",
-        ...filtered,
-      });
-    }
-  });
-
-  // --- ROUTE UPDATE (driver → users) ---
-  socket.on("routeUpdate", (data) => {
-    if (!data?.accountId) return;
-    console.log(`🛣️ Route data received from driver ${data.accountId}`);
-
-    drivers[data.accountId] = {
-      ...drivers[data.accountId],
-      geometry: data.geometry,
-      destinationLat: data.destinationLat,
-      destinationLng: data.destinationLng,
-      destinationName: data.destinationName || "Unknown",
-      lastUpdated: new Date().toISOString(),
-    };
-
-    io.to("user").emit("routeUpdate", {
-      from: "driver",
-      ...data,
-    });
-  });
-
-  // --- PASSENGER COUNT UPDATES ---
-  socket.on("passengerUpdate", (data) => {
-    const { accountId, passengerCount, maxCapacity, organizationName } = data || {};
-    if (!accountId) return;
-
-    const prev = drivers[accountId] || {};
+    // Update memory
     drivers[accountId] = {
-      ...prev,
-      passengerCount: passengerCount ?? prev.passengerCount ?? 0,
-      maxCapacity: maxCapacity ?? prev.maxCapacity ?? 0,
-      organizationName: organizationName || prev.organizationName || "No Organization",
+      ...drivers[accountId],
+      accountId,
+      organizationName: organizationName || drivers[accountId]?.organizationName || "No Organization",
+      destinationName: destinationName || drivers[accountId]?.destinationName || "Unknown",
+      destinationLat: destinationLat ?? drivers[accountId]?.destinationLat,
+      destinationLng: destinationLng ?? drivers[accountId]?.destinationLng,
+      lat,
+      lng,
+      passengerCount: passengerCount ?? drivers[accountId]?.passengerCount ?? 0,
+      maxCapacity: maxCapacity ?? drivers[accountId]?.maxCapacity ?? 0,
       lastUpdated: new Date().toISOString(),
     };
 
-    io.to("user").emit("passengerCountUpdate", {
+    // Broadcast coordinates only to users
+    io.to("user").emit("locationUpdate", {
       from: "driver",
       accountId,
-      passengerCount: drivers[accountId].passengerCount,
-      maxCapacity: drivers[accountId].maxCapacity,
-      organizationName: drivers[accountId].organizationName,
+      lat,
+      lng,
+      destinationLat,
+      destinationLng,
     });
+
+    console.log(
+      `📡 [${accountId}] Location broadcast → Bus (${lat}, ${lng}) | Destination (${destinationLat}, ${destinationLng})`
+    );
   });
 
-  // --- DESTINATION UPDATE ---
+  // --- DESTINATION UPDATE (if sent separately) ---
   socket.on("destinationUpdate", (data) => {
     const { accountId, destinationName, destinationLat, destinationLng } = data || {};
     if (!accountId) return;
@@ -126,40 +106,107 @@ io.on("connection", (socket) => {
       lastUpdated: new Date().toISOString(),
     };
 
+    // Broadcast to users (coords only)
     io.to("user").emit("destinationUpdate", {
       from: "driver",
       accountId,
-      destinationName,
       destinationLat,
       destinationLng,
     });
+
+    console.log(`🎯 [${accountId}] Destination updated: (${destinationLat}, ${destinationLng})`);
   });
 
-  // --- NEW FEATURE: GET BUS INFO (user → server → user) ---
+// --- ROUTE UPDATE (Driver → Server → Users) ---
+socket.on("routeUpdate", (data) => {
+  /**
+   * Expect:
+   * {
+   *   accountId,
+   *   geometry, // encoded polyline string
+   *   destinationLat,
+   *   destinationLng
+   * }
+   */
+  if (!data?.accountId) return;
+
+  const { accountId, geometry, destinationLat, destinationLng } = data;
+
+  // Store route info in memory
+  drivers[accountId] = {
+    ...drivers[accountId],
+    accountId,
+    geometry, // encoded polyline string
+    destinationLat,
+    destinationLng,
+    lastUpdated: new Date().toISOString(),
+  };
+
+  // Broadcast route geometry to users (for displaying route on map)
+  io.to("user").emit("routeUpdate", {
+    from: "driver",
+    accountId,
+    geometry,
+    destinationLat,
+    destinationLng,
+  });
+
+  console.log(
+    `🗺️ [${accountId}] Sent routeUpdate with encoded polyline + destination (${destinationLat}, ${destinationLng})`
+  );
+});
+
+  // --- PASSENGER COUNT UPDATE (Driver → Server Only) ---
+  socket.on("passengerUpdate", (data) => {
+    const { accountId, passengerCount, maxCapacity } = data || {};
+    if (!accountId) return;
+
+    const prev = drivers[accountId] || {};
+    drivers[accountId] = {
+      ...prev,
+      passengerCount: passengerCount ?? prev.passengerCount ?? 0,
+      maxCapacity: maxCapacity ?? prev.maxCapacity ?? 0,
+      lastUpdated: new Date().toISOString(),
+    };
+
+    console.log(`🧍 Passenger count updated for ${accountId}: ${drivers[accountId].passengerCount}/${drivers[accountId].maxCapacity}`);
+  });
+
+  // --- USER REQUEST: Get Extra Bus Info ---
   socket.on("getBusInfo", (data) => {
     const { accountId } = data || {};
-    if (!accountId) return socket.emit("busInfoError", { message: "Missing accountId" });
+    if (!accountId)
+      return socket.emit("busInfoError", { message: "Missing accountId" });
 
     const busData = drivers[accountId];
     if (busData) {
       console.log(`ℹ️ Bus info requested for ${accountId}`);
       socket.emit("busInfo", {
-        accountId,
-        ...busData,
         from: "server",
+        accountId: busData.accountId,
+        organizationName: busData.organizationName,
+        destinationName: busData.destinationName,
+        destinationLat: busData.destinationLat,
+        destinationLng: busData.destinationLng,
+        passengerCount: busData.passengerCount,
+        maxCapacity: busData.maxCapacity,
+        lastUpdated: busData.lastUpdated,
       });
     } else {
       socket.emit("busInfoError", { message: "Bus not found or inactive" });
     }
   });
 
-  // --- NEW USERS REQUEST ALL ACTIVE DRIVERS ---
+  // --- USER REQUEST: Get All Active Drivers (for app load) ---
   socket.on("requestDriversData", () => {
     console.log(`📋 ${socket.id} requested active drivers`);
     socket.emit("driversData", {
       drivers: Object.entries(drivers).map(([accountId, data]) => ({
         accountId,
-        ...data,
+        lat: data.lat,
+        lng: data.lng,
+        destinationLat: data.destinationLat,
+        destinationLng: data.destinationLng,
       })),
     });
   });
@@ -170,6 +217,6 @@ io.on("connection", (socket) => {
   });
 });
 
-// Use PORT from hosting service or 3000 locally
+// ========== SERVER START ==========
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, () => console.log(`✅ Server running on port ${PORT}`));
