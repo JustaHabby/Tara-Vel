@@ -188,7 +188,7 @@ io.on("connection", (socket) => {
 
   // --- USER REQUEST: Get Specific Bus Info ---
   socket.on("getBusInfo", (data) => {
-    const { accountId } = data || {};
+  const { accountId } = data || {};
     if (!accountId) return socket.emit("busInfoError", { message: "Missing accountId" });
 
     const busData = drivers[accountId];
