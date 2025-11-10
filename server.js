@@ -29,6 +29,36 @@ io.on("connection", (socket) => {
       socket.role = role;
       socket.join(role);
       console.log(`🆔 ${socket.id} registered as ${role}`);
+
+      // 🧠 If user connects, instantly replay all current driver data
+      if (role === "user") {
+        Object.values(drivers).forEach((driver) => {
+          // Send route geometry if exists
+          if (driver.geometry) {
+            socket.emit("routeUpdate", {
+              from: "driver",
+              accountId: driver.accountId,
+              geometry: driver.geometry,
+              destinationLat: driver.destinationLat,
+              destinationLng: driver.destinationLng,
+            });
+          }
+
+          // Send last known location if available
+          if (driver.lat && driver.lng) {
+            socket.emit("locationUpdate", {
+              from: "driver",
+              accountId: driver.accountId,
+              lat: driver.lat,
+              lng: driver.lng,
+              destinationLat: driver.destinationLat,
+              destinationLng: driver.destinationLng,
+            });
+          }
+        });
+
+        console.log(`📤 Replayed ${Object.keys(drivers).length} active driver(s) to new user ${socket.id}`);
+      }
     } else {
       console.log(`⚠️ Unknown role from ${socket.id}: ${role}`);
     }
@@ -36,20 +66,6 @@ io.on("connection", (socket) => {
 
   // --- LOCATION UPDATES (Driver → Server → Users) ---
   socket.on("updateLocation", (data) => {
-    /**
-     * Expect:
-     * {
-     *   accountId,
-     *   organizationName,
-     *   destinationName,
-     *   destinationLat,
-     *   destinationLng,
-     *   lat,
-     *   lng,
-     *   passengerCount,
-     *   maxCapacity
-     * }
-     */
     if (!data?.accountId) return;
     const {
       accountId,
@@ -63,7 +79,7 @@ io.on("connection", (socket) => {
       maxCapacity,
     } = data;
 
-    // Update memory
+    // 🧠 Update memory cache
     drivers[accountId] = {
       ...drivers[accountId],
       accountId,
@@ -78,7 +94,7 @@ io.on("connection", (socket) => {
       lastUpdated: new Date().toISOString(),
     };
 
-    // Broadcast coordinates only to users
+    // 🔁 Broadcast to all users
     io.to("user").emit("locationUpdate", {
       from: "driver",
       accountId,
@@ -106,7 +122,7 @@ io.on("connection", (socket) => {
       lastUpdated: new Date().toISOString(),
     };
 
-    // Broadcast to users (coords only)
+    // Broadcast to users
     io.to("user").emit("destinationUpdate", {
       from: "driver",
       accountId,
@@ -117,46 +133,37 @@ io.on("connection", (socket) => {
     console.log(`🎯 [${accountId}] Destination updated: (${destinationLat}, ${destinationLng})`);
   });
 
-// --- ROUTE UPDATE (Driver → Server → Users) ---
-socket.on("routeUpdate", (data) => {
-  /**
-   * Expect:
-   * {
-   *   accountId,
-   *   geometry, // encoded polyline string
-   *   destinationLat,
-   *   destinationLng
-   * }
-   */
-  if (!data?.accountId) return;
+  // --- ROUTE UPDATE (Driver → Server → Users) ---
+  socket.on("routeUpdate", (data) => {
+    if (!data?.accountId) return;
 
-  const { accountId, geometry, destinationLat, destinationLng } = data;
+    const { accountId, geometry, destinationLat, destinationLng } = data;
 
-  // Store route info in memory
-  drivers[accountId] = {
-    ...drivers[accountId],
-    accountId,
-    geometry, // encoded polyline string
-    destinationLat,
-    destinationLng,
-    lastUpdated: new Date().toISOString(),
-  };
+    // 🧠 Store route info in memory
+    drivers[accountId] = {
+      ...drivers[accountId],
+      accountId,
+      geometry, // encoded polyline string
+      destinationLat,
+      destinationLng,
+      lastUpdated: new Date().toISOString(),
+    };
 
-  // Broadcast route geometry to users (for displaying route on map)
-  io.to("user").emit("routeUpdate", {
-    from: "driver",
-    accountId,
-    geometry,
-    destinationLat,
-    destinationLng,
+    // 🔁 Broadcast to all users
+    io.to("user").emit("routeUpdate", {
+      from: "driver",
+      accountId,
+      geometry,
+      destinationLat,
+      destinationLng,
+    });
+
+    console.log(
+      `🗺️ [${accountId}] Sent routeUpdate with encoded polyline + destination (${destinationLat}, ${destinationLng})`
+    );
   });
 
-  console.log(
-    `🗺️ [${accountId}] Sent routeUpdate with encoded polyline + destination (${destinationLat}, ${destinationLng})`
-  );
-});
-
-  // --- PASSENGER COUNT UPDATE (Driver → Server Only) ---
+  // --- PASSENGER COUNT UPDATE ---
   socket.on("passengerUpdate", (data) => {
     const { accountId, passengerCount, maxCapacity } = data || {};
     if (!accountId) return;
@@ -169,10 +176,12 @@ socket.on("routeUpdate", (data) => {
       lastUpdated: new Date().toISOString(),
     };
 
-    console.log(`🧍 Passenger count updated for ${accountId}: ${drivers[accountId].passengerCount}/${drivers[accountId].maxCapacity}`);
+    console.log(
+      `🧍 Passenger count updated for ${accountId}: ${drivers[accountId].passengerCount}/${drivers[accountId].maxCapacity}`
+    );
   });
 
-  // --- USER REQUEST: Get Extra Bus Info ---
+  // --- USER REQUEST: Get Specific Bus Info ---
   socket.on("getBusInfo", (data) => {
     const { accountId } = data || {};
     if (!accountId)
@@ -197,7 +206,7 @@ socket.on("routeUpdate", (data) => {
     }
   });
 
-  // --- USER REQUEST: Get All Active Drivers (for app load) ---
+  // --- USER REQUEST: Get All Active Drivers ---
   socket.on("requestDriversData", () => {
     console.log(`📋 ${socket.id} requested active drivers`);
     socket.emit("driversData", {
@@ -214,6 +223,13 @@ socket.on("routeUpdate", (data) => {
   // --- DISCONNECT HANDLER ---
   socket.on("disconnect", () => {
     console.log(`❌ Disconnected: ${socket.id} (${socket.role || "unknown"})`);
+
+    // 🧹 Optional: remove driver if disconnected
+    if (socket.role === "driver") {
+      for (const [id, d] of Object.entries(drivers)) {
+        if (d.socketId === socket.id) delete drivers[id];
+      }
+    }
   });
 });
 
