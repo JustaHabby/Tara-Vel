@@ -113,30 +113,37 @@ io.on("connection", (socket) => {
 );
   });
 
-  // --- DESTINATION UPDATE ---
-  socket.on("destinationUpdate", (data) => {
-    const { accountId, destinationName, destinationLat, destinationLng } = data || {};
-    if (!accountId) return;
+ // --- DESTINATION UPDATE ---
+socket.on("destinationUpdate", (data) => {
+  const { accountId, destinationName, destinationLat, destinationLng } = data || {};
+  if (!accountId) return;
 
-    drivers[accountId] = {
-      ...drivers[accountId],
-      destinationName: destinationName || "Unknown",
-      destinationLat,
-      destinationLng,
-      lastUpdated: new Date().toISOString(),
-    };
+  // Defensive update: preserve previous values if null/undefined
+  const prev = drivers[accountId] || {};
+  drivers[accountId] = {
+    ...prev,
+    destinationName: destinationName ?? prev.destinationName ?? "Unknown",
+    destinationLat: destinationLat ?? prev.destinationLat,
+    destinationLng: destinationLng ?? prev.destinationLng,
+    lastUpdated: new Date().toISOString(),
+  };
 
-    io.to("user").emit("destinationUpdate", {
-      from: "driver",
-      accountId,
-      destinationLat,
-      destinationLng,
-      passengerCount: drivers[accountId].passengerCount ?? 0,
-      maxCapacity: drivers[accountId].maxCapacity ?? 0,
-    });
-
-    console.log(`🎯 [${accountId}] Destination updated: (${destinationLat}, ${destinationLng})`);
+  // Broadcast full destination info to users
+  io.to("user").emit("destinationUpdate", {
+    from: "driver",
+    accountId,
+    destinationName: drivers[accountId].destinationName,
+    destinationLat: drivers[accountId].destinationLat,
+    destinationLng: drivers[accountId].destinationLng,
+    passengerCount: drivers[accountId].passengerCount ?? 0,
+    maxCapacity: drivers[accountId].maxCapacity ?? 0,
   });
+
+  console.log(
+    `🎯 [${accountId}] Destination updated: ${drivers[accountId].destinationName} (${drivers[accountId].destinationLat}, ${drivers[accountId].destinationLng})`
+  );
+});
+
 
   // --- ROUTE UPDATE ---
   socket.on("routeUpdate", (data) => {
