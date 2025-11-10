@@ -30,10 +30,9 @@ io.on("connection", (socket) => {
       socket.join(role);
       console.log(`🆔 ${socket.id} registered as ${role}`);
 
-      // 🧠 If user connects, instantly replay all current driver data
       if (role === "user") {
+        // Replay all active drivers with passenger info
         Object.values(drivers).forEach((driver) => {
-          // Send route geometry if exists
           if (driver.geometry) {
             socket.emit("routeUpdate", {
               from: "driver",
@@ -41,10 +40,11 @@ io.on("connection", (socket) => {
               geometry: driver.geometry,
               destinationLat: driver.destinationLat,
               destinationLng: driver.destinationLng,
+              passengerCount: driver.passengerCount ?? 0,
+              maxCapacity: driver.maxCapacity ?? 0,
             });
           }
 
-          // Send last known location if available
           if (driver.lat && driver.lng) {
             socket.emit("locationUpdate", {
               from: "driver",
@@ -53,6 +53,8 @@ io.on("connection", (socket) => {
               lng: driver.lng,
               destinationLat: driver.destinationLat,
               destinationLng: driver.destinationLng,
+              passengerCount: driver.passengerCount ?? 0,
+              maxCapacity: driver.maxCapacity ?? 0,
             });
           }
         });
@@ -79,7 +81,7 @@ io.on("connection", (socket) => {
       maxCapacity,
     } = data;
 
-    // 🧠 Update memory cache
+    // Update memory cache
     drivers[accountId] = {
       ...drivers[accountId],
       accountId,
@@ -94,7 +96,7 @@ io.on("connection", (socket) => {
       lastUpdated: new Date().toISOString(),
     };
 
-    // 🔁 Broadcast to all users
+    // Broadcast to all users including passenger info
     io.to("user").emit("locationUpdate", {
       from: "driver",
       accountId,
@@ -102,14 +104,16 @@ io.on("connection", (socket) => {
       lng,
       destinationLat,
       destinationLng,
+      passengerCount: drivers[accountId].passengerCount,
+      maxCapacity: drivers[accountId].maxCapacity,
     });
 
     console.log(
-      `📡 [${accountId}] Location broadcast → Bus (${lat}, ${lng}) | Destination (${destinationLat}, ${destinationLng})`
+      `📡 [${accountId}] Location broadcast → Bus (${lat}, ${lng}) | Destination (${destinationLat}, ${destinationLng}) | Passengers ${drivers[accountId].passengerCount}/${drivers[accountId].maxCapacity}`
     );
   });
 
-  // --- DESTINATION UPDATE (if sent separately) ---
+  // --- DESTINATION UPDATE ---
   socket.on("destinationUpdate", (data) => {
     const { accountId, destinationName, destinationLat, destinationLng } = data || {};
     if (!accountId) return;
@@ -122,44 +126,45 @@ io.on("connection", (socket) => {
       lastUpdated: new Date().toISOString(),
     };
 
-    // Broadcast to users
     io.to("user").emit("destinationUpdate", {
       from: "driver",
       accountId,
       destinationLat,
       destinationLng,
+      passengerCount: drivers[accountId].passengerCount ?? 0,
+      maxCapacity: drivers[accountId].maxCapacity ?? 0,
     });
 
     console.log(`🎯 [${accountId}] Destination updated: (${destinationLat}, ${destinationLng})`);
   });
 
-  // --- ROUTE UPDATE (Driver → Server → Users) ---
+  // --- ROUTE UPDATE ---
   socket.on("routeUpdate", (data) => {
     if (!data?.accountId) return;
 
     const { accountId, geometry, destinationLat, destinationLng } = data;
 
-    // 🧠 Store route info in memory
     drivers[accountId] = {
       ...drivers[accountId],
       accountId,
-      geometry, // encoded polyline string
+      geometry,
       destinationLat,
       destinationLng,
       lastUpdated: new Date().toISOString(),
     };
 
-    // 🔁 Broadcast to all users
     io.to("user").emit("routeUpdate", {
       from: "driver",
       accountId,
       geometry,
       destinationLat,
       destinationLng,
+      passengerCount: drivers[accountId].passengerCount ?? 0,
+      maxCapacity: drivers[accountId].maxCapacity ?? 0,
     });
 
     console.log(
-      `🗺️ [${accountId}] Sent routeUpdate with encoded polyline + destination (${destinationLat}, ${destinationLng})`
+      `🗺️ [${accountId}] Sent routeUpdate + destination + passengers (${drivers[accountId].passengerCount}/${drivers[accountId].maxCapacity})`
     );
   });
 
@@ -183,13 +188,11 @@ io.on("connection", (socket) => {
 
   // --- USER REQUEST: Get Specific Bus Info ---
   socket.on("getBusInfo", (data) => {
-    const { accountId } = data || {};
-    if (!accountId)
-      return socket.emit("busInfoError", { message: "Missing accountId" });
+    const { accountId } = data ?: {};
+    if (!accountId) return socket.emit("busInfoError", { message: "Missing accountId" });
 
     const busData = drivers[accountId];
     if (busData) {
-      console.log(`ℹ️ Bus info requested for ${accountId}`);
       socket.emit("busInfo", {
         from: "server",
         accountId: busData.accountId,
@@ -208,7 +211,6 @@ io.on("connection", (socket) => {
 
   // --- USER REQUEST: Get All Active Drivers ---
   socket.on("requestDriversData", () => {
-    console.log(`📋 ${socket.id} requested active drivers`);
     socket.emit("driversData", {
       drivers: Object.entries(drivers).map(([accountId, data]) => ({
         accountId,
@@ -216,6 +218,8 @@ io.on("connection", (socket) => {
         lng: data.lng,
         destinationLat: data.destinationLat,
         destinationLng: data.destinationLng,
+        passengerCount: data.passengerCount ?? 0,
+        maxCapacity: data.maxCapacity ?? 0,
       })),
     });
   });
@@ -223,8 +227,6 @@ io.on("connection", (socket) => {
   // --- DISCONNECT HANDLER ---
   socket.on("disconnect", () => {
     console.log(`❌ Disconnected: ${socket.id} (${socket.role || "unknown"})`);
-
-    // 🧹 Optional: remove driver if disconnected
     if (socket.role === "driver") {
       for (const [id, d] of Object.entries(drivers)) {
         if (d.socketId === socket.id) delete drivers[id];
