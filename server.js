@@ -109,7 +109,8 @@ io.on("connection", (socket) => {
     });
 
     console.log(
-      `📡 [${accountId}] Location broadcast → Bus (${lat}, ${lng}) | Destination (${destinationLat}, ${destinationLng}) | Passengers ${drivers[accountId].passengerCount}/${drivers[accountId].maxCapacity}`
+      `📡 [${accountId}] Location broadcast → Bus (${lat}, ${lng}) | Destination: ${drivers[accountId].destinationName} (${destinationLat}, ${destinationLng}) | Passengers ${drivers[accountId].passengerCount}/${drivers[accountId].maxCapacity}`
+);
     );
   });
 
