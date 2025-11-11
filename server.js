@@ -1106,15 +1106,70 @@ app.get("/health", (req, res) => {
    console.log(`📍 Location update interval: ${LOCATION_UPDATE_INTERVAL / 1000}s (15-second heartbeat enabled)`);
  });
  
- /**
-  * Graceful shutdown handler
-  * * Handles SIGTERM signal (sent by process managers like PM2, Docker, etc.)
-  * to allow the server to shut down gracefully, closing connections properly.
-  */
- process.on("SIGTERM", () => {
-   console.log("SIGTERM received, shutting down gracefully");
-   server.close(() => {
-     console.log("Server closed");
-     process.exit(0);
-   });
- });
+/**
+ * Graceful shutdown handler
+ * * Handles SIGTERM/SIGINT signals (sent by process managers like PM2, Docker, etc.)
+ * to allow the server to shut down gracefully, closing connections properly.
+ * * Steps:
+ * 1. Mark all drivers as disconnected (trigger grace period)
+ * 2. Notify all clients that server is shutting down
+ * 3. Close Socket.IO server (closes all WebSocket connections)
+ * 4. Close HTTP server
+ * 5. Exit process
+ * * NOTE: On server restart, all in-memory data is lost (expected behavior).
+ * Drivers will automatically reconnect and restore their data by sending updates.
+ */
+function gracefulShutdown(signal) {
+  console.log(`${signal} received, shutting down gracefully`);
+  
+  // Mark all active drivers as disconnected (preserve data for grace period)
+  // NOTE: This only helps if server restarts within grace period. 
+  // On full restart, all in-memory data is lost (this is expected behavior).
+  const activeDrivers = Object.keys(drivers).filter(
+    accountId => drivers[accountId] && !drivers[accountId].disconnected
+  );
+  
+  if (activeDrivers.length > 0) {
+    const now = Date.now();
+    activeDrivers.forEach(accountId => {
+      drivers[accountId].disconnected = true;
+      drivers[accountId].disconnectedAt = now;
+      drivers[accountId].socketId = null;
+    });
+    console.log(`🔌 Marked ${activeDrivers.length} driver(s) as disconnected`);
+  }
+  
+  // Notify all clients that server is shutting down
+  // Clients should automatically reconnect when server restarts
+  try {
+    io.emit("serverShutdown", { 
+      message: "Server is shutting down. Reconnecting...",
+      timestamp: new Date().toISOString()
+    });
+  } catch (error) {
+    console.log("⚠️ Error notifying clients:", error.message);
+  }
+  
+  // Give clients a moment to receive the shutdown message
+  setTimeout(() => {
+    // Close Socket.IO server (closes all WebSocket connections properly)
+    io.close(() => {
+      console.log("Socket.IO server closed - all connections terminated");
+      
+      // Close HTTP server (stops accepting new connections)
+      server.close(() => {
+        console.log("HTTP server closed");
+        console.log(`SERVER: Graceful shutdown complete`);
+        console.log(`SERVER: NOTE: On server restart, all in-memory data will be lost.`);
+        console.log(`SERVER: Drivers will need to reconnect and send updates to restore data.`);
+        process.exit(0);
+      });
+    });
+  }, 500); // 500ms grace period for clients to receive shutdown message
+}
+
+// Handle SIGTERM (production deployments, Docker, etc.)
+process.on("SIGTERM", () => gracefulShutdown("SIGTERM"));
+
+// Handle SIGINT (Ctrl+C in development)
+process.on("SIGINT", () => gracefulShutdown("SIGINT"));
