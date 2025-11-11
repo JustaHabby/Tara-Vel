@@ -860,6 +860,20 @@ io.on("connection", (socket) => {
     });
   }));
 
+  // --- USER REQUEST: Get Current Data for Late Joiners ---
+  socket.on("requestCurrentData", () => {
+    const buses = Object.values(drivers).map((driver) => ({
+      accountId: driver.accountId,
+      lat: driver.lat ?? null,
+      lng: driver.lng ?? null,
+      geometry: driver.geometry ?? "",
+      destinationName: driver.destinationName ?? "Unknown",
+      destinationLat: driver.destinationLat ?? null,
+      destinationLng: driver.destinationLng ?? null,
+      passengerCount: driver.passengerCount ?? 0,
+      maxCapacity: driver.maxCapacity ?? 0,
+    }));
+  
   // --- DISCONNECT HANDLER ---
   /**
    * disconnect Event Handler
