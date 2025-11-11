@@ -240,8 +240,8 @@
   * * Ensures that the data object contains valid location information:
   * - Must be an object
   * - Must have a valid accountId (non-empty string)
-  * - Latitude must be between -90 and 90 (if provided)
-  * - Longitude must be between -180 and 180 (if provided)
+  * - Latitude must be a number between -90 and 90 (required for location updates)
+  * - Longitude must be a number between -180 and 180 (required for location updates)
   * * @param {object} data - The location data to validate
   * @returns {boolean} True if data is valid, false otherwise
   * * @example
@@ -253,8 +253,13 @@
  function validateLocationData(data) {
    if (!data || typeof data !== "object") return false;
    if (!data.accountId || typeof data.accountId !== "string") return false;
-   if (data.lat !== undefined && (typeof data.lat !== "number" || data.lat < -90 || data.lat > 90)) return false;
-   if (data.lng !== undefined && (typeof data.lng !== "number" || data.lng < -180 || data.lng > 180)) return false;
+   // Coordinates are required for location updates
+   if (data.lat === undefined || data.lng === undefined) return false;
+   // Handle string coordinates (convert and validate)
+   const lat = typeof data.lat === "string" ? parseFloat(data.lat) : data.lat;
+   const lng = typeof data.lng === "string" ? parseFloat(data.lng) : data.lng;
+   if (typeof lat !== "number" || isNaN(lat) || lat < -90 || lat > 90) return false;
+   if (typeof lng !== "number" || isNaN(lng) || lng < -180 || lng > 180) return false;
    return true;
  }
  
@@ -271,13 +276,13 @@
      uptime: process.uptime()
    });
  });
- /**
-  * Health check endpoint
-  * Used by monitoring services to check if the server is alive
-  */
- app.get("/health", (req, res) => {
-   res.json({ status: "healthy", timestamp: new Date().toISOString() });
- });
+/**
+ * Health check endpoint
+ * Used by monitoring services to check if the server is alive
+ */
+app.get("/health", (req, res) => {
+  res.json({ status: "healthy", timestamp: new Date().toISOString() });
+});
  
  // ========== SOCKET.IO CONNECTION HANDLER ==========
  
@@ -473,34 +478,66 @@
     * @emits error - Sent to client if data is invalid or rate limit exceeded
     */
    socket.on("updateLocation", safeHandler("updateLocation", (data) => {
+     // Debug: Log raw incoming data (before validation)
+     if (IS_DEV) {
+       log(`📥 [RAW] Received updateLocation from ${data?.accountId || socket.id}: lat=${data?.lat}, lng=${data?.lng}, timestamp=${new Date().toISOString()}`);
+     }
+     
      // Validate incoming data
      if (!validateLocationData(data)) {
+       log(`❌ [${data?.accountId || socket.id}] Validation failed for updateLocation`, "error");
        socket.emit("error", { message: "Invalid location data" });
        return;
      }
- 
+
      // Rate limiting check - prevent abuse
      if (!checkRateLimit(socket.id, MAX_LOCATION_UPDATES_PER_MINUTE)) {
        log(`⚠️ Rate limit exceeded for ${socket.id}`, "error");
        return;
      }
- 
-     const {
-       accountId,
-       organizationName,
-       destinationName,
-       destinationLat,
-       destinationLng,
-       lat,
-       lng,
-       passengerCount,
-       maxCapacity,
-     } = data;
-     // Retrieve the previous/before-this-update data for this accountId (bus/driver).
-     // This allows us to compare the new update against the last known/broadcasted state,
-     // such as for change detection and deciding whether to broadcast this update.
-     const prevDriver = drivers[accountId];
-     const now = Date.now();
+
+    // Extract data (coordinates are already validated as valid numbers)
+    const {
+      accountId,
+      organizationName,
+      destinationName,
+      destinationLat,
+      destinationLng,
+      lat: rawLat,
+      lng: rawLng,
+      passengerCount,
+      maxCapacity,
+    } = data;
+    
+    // Convert coordinates to numbers (validation ensures they're valid, but may be strings)
+    const lat = typeof rawLat === "string" ? parseFloat(rawLat) : rawLat;
+    const lng = typeof rawLng === "string" ? parseFloat(rawLng) : rawLng;
+    
+    // Debug: Log exact values being processed
+    if (IS_DEV) {
+      log(`🔍 [${accountId}] Processing coordinates - rawLat: ${rawLat} (type: ${typeof rawLat}), rawLng: ${rawLng} (type: ${typeof rawLng}) → lat: ${lat}, lng: ${lng}`);
+    }
+    
+    // Retrieve the previous/before-this-update data for this accountId (bus/driver).
+    // This allows us to compare the new update against the last known/broadcasted state,
+    // such as for change detection and deciding whether to broadcast this update.
+    const prevDriver = drivers[accountId];
+    const now = Date.now();
+    
+    // Debug: Log coordinate changes (received vs stored)
+    if (IS_DEV) {
+      if (!prevDriver) {
+        log(`🆕 [${accountId}] First location update received: (${lat?.toFixed(6)}, ${lng?.toFixed(6)})`);
+      } else {
+        const coordChanged = prevDriver.lat !== lat || prevDriver.lng !== lng;
+        if (coordChanged) {
+          const distance = calculateDistance(prevDriver.lat, prevDriver.lng, lat, lng);
+          log(`🔄 [${accountId}] Coordinates changed: (${prevDriver.lat?.toFixed(6)}, ${prevDriver.lng?.toFixed(6)}) → (${lat?.toFixed(6)}, ${lng?.toFixed(6)}) [distance: ${(distance * 111000).toFixed(2)}m]`);
+        } else {
+          log(`📍 [${accountId}] Received same coordinates: (${lat?.toFixed(6)}, ${lng?.toFixed(6)}) - stationary or GPS returning same location`);
+        }
+      }
+    }
      
      // Calculate time since last broadcast (Infinity if no previous broadcast)
      const timeSinceLastBroadcast = prevDriver?.lastBroadcastTime ?
@@ -574,7 +611,7 @@
  
      // Broadcast to all users if conditions are met
      if (shouldBroadcast) {
-       io.to("user").emit("locationUpdate", {
+       const broadcastData = {
          from: "driver",
          accountId,
          lat,
@@ -583,23 +620,31 @@
          destinationLat: drivers[accountId].destinationLat,
          destinationLng: drivers[accountId].destinationLng,
          passengerCount: drivers[accountId].passengerCount,
-        
-   maxCapacity: drivers[accountId].maxCapacity,
-       });
- 
+         maxCapacity: drivers[accountId].maxCapacity,
+       };
+       
+       io.to("user").emit("locationUpdate", broadcastData);
+
        // Log the reason for broadcasting (for debugging)
        const reason = !prevDriver ?
   "initial" : 
-                      locationChanged ?
+                     locationChanged ?
   "moved" : 
-                      passengerDataChanged ?
+                     passengerDataChanged ?
   "passengers" : 
-                      "interval";
+                     "interval";
  // 15-second heartbeat
-       log(`📡 [${accountId}] Location broadcast (${reason}) → (${lat?.toFixed(4)}, ${lng?.toFixed(4)}) | Passengers ${drivers[accountId].passengerCount}/${drivers[accountId].maxCapacity}`);
+       log(`📡 [${accountId}] Location broadcast (${reason}) → (${lat?.toFixed(6)}, ${lng?.toFixed(6)}) | Passengers ${drivers[accountId].passengerCount}/${drivers[accountId].maxCapacity}`);
+       log(`📤 [${accountId}] Broadcasting to users: ${JSON.stringify({ accountId, lat, lng, timestamp: new Date().toISOString() })}`);
      } else {
        // Data updated but not broadcast (e.g., update came too soon after last broadcast)
-       log(`📍 [${accountId}] Location updated (no broadcast) → (${lat?.toFixed(4)}, ${lng?.toFixed(4)})`);
+       log(`📍 [${accountId}] Location updated (no broadcast) → (${lat?.toFixed(6)}, ${lng?.toFixed(6)}) | Stored but not sent (too soon after last broadcast)`);
+     }
+     
+     // Debug: Show what's stored in memory after update
+     if (IS_DEV) {
+       const stored = drivers[accountId];
+       log(`💾 [${accountId}] Stored in memory: lat=${stored.lat?.toFixed(6)}, lng=${stored.lng?.toFixed(6)}, lastBroadcastTime=${stored.lastBroadcastTime ? new Date(stored.lastBroadcastTime).toISOString() : 'never'}`);
      }
    }));
  
