@@ -358,9 +358,16 @@ app.get("/health", (req, res) => {
        log(`⚠️ Unknown role from ${socket.id}: ${role}`);
        return;
      }
- 
+
     socket.role = role;
     socket.join(role);
+    
+    // Reset rate limit on role registration to allow grace period after reconnection
+    // This prevents rate limiting when app reconnects and sends initial updates
+    if (rateLimitMap[socket.id]) {
+      delete rateLimitMap[socket.id];
+    }
+    
     log(`🆔 ${socket.id} registered as ${role}`);
 
     if (role === "user") {
@@ -487,7 +494,10 @@ app.get("/health", (req, res) => {
 
      // Rate limiting check - prevent abuse
      if (!checkRateLimit(socket.id, MAX_LOCATION_UPDATES_PER_MINUTE)) {
-       log(`⚠️ Rate limit exceeded for ${socket.id}`, "error");
+       const accountId = data?.accountId || socketToAccountId[socket.id] || "unknown";
+       const role = socket.role || "unregistered";
+       log(`⚠️ Rate limit exceeded for ${socket.id} (${accountId}, ${role}) - Too many updates sent`, "error");
+       socket.emit("error", { message: "Rate limit exceeded. Please slow down location updates." });
        return;
      }
 
