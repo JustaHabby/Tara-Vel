@@ -360,7 +360,7 @@ io.on("connection", (socket) => {
 
     if (role === "user") {
       }
-}));
+
   /**
    * OPTIMIZATION: Batch all driver data into a single message.
    * Instead of sending multiple individual events, we send one
@@ -437,7 +437,7 @@ io.on("connection", (socket) => {
     log(`❌ Error sending late joiner snapshot to ${socket.id}:`, err);
   }
 }
-
+}));
 
   // --- LOCATION UPDATES (Driver → Server → Users) ---
   /**
