@@ -873,6 +873,10 @@ io.on("connection", (socket) => {
       passengerCount: driver.passengerCount ?? 0,
       maxCapacity: driver.maxCapacity ?? 0,
     }));
+
+    // send current buses data to the requester
+    socket.emit("currentData", { drivers: buses });
+  });
   
   // --- DISCONNECT HANDLER ---
   /**
