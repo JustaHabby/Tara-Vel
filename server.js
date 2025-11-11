@@ -30,11 +30,24 @@
  
  /** Enable development logging (set to false in production to reduce console output) */
  const IS_DEV = true;
- /** * Time in milliseconds before a driver is considered stale and removed from memory.
-  * Drivers that haven't sent updates in this time will be cleaned up.
-  * Default: 5 minutes (300,000ms)
-  */
- const STALE_DRIVER_TIMEOUT = 5 * 60 * 1000;
+/** * Time in milliseconds before a driver is considered stale and removed from memory.
+ * Drivers that haven't sent updates in this time will be cleaned up.
+ * Default: 5 minutes (300,000ms)
+ */
+const STALE_DRIVER_TIMEOUT = 5 * 60 * 1000;
+/**
+ * Grace period after disconnect before driver data is removed (in milliseconds).
+ * During this period, driver data is preserved to allow for reconnection.
+ * If driver reconnects within this period, data is restored.
+ * Default: 30 seconds (30,000ms)
+ */
+const DISCONNECT_GRACE_PERIOD = 30 * 1000;
+/**
+ * Maximum number of reconnection attempts allowed within grace period.
+ * After this many reconnections, driver data will be kept but marked as potentially unstable.
+ * Default: 3 reconnection attempts
+ */
+const MAX_RECONNECT_ATTEMPTS = 3;
  /**
   * Minimum distance change (in degrees) required to trigger a location broadcast.
   * This prevents broadcasting tiny GPS fluctuations while the bus is stationary.
@@ -98,27 +111,30 @@
  
  // ========== IN-MEMORY DATA STORES ==========
  
- /**
-  * Active drivers data store
-  * Structure: { accountId: { 
-  * accountId: string,
-  * socketId: string,
-  * lat: number,
-  * lng: number,
-  * destinationLat: number,
-  * destinationLng: number,
-  * destinationName: string,
-  * organizationName: string,
-  * geometry: object (route geometry data),
-  * passengerCount: number,
-  * maxCapacity: number,
-  * lastUpdated: string (ISO timestamp),
-  * lastLat: number (last broadcasted latitude),
-  * lastLng: number (last broadcasted longitude),
-  * lastBroadcastTime: number (timestamp of last broadcast)
-  * } }
-  */
- const drivers = {};
+/**
+ * Active drivers data store
+ * Structure: { accountId: { 
+ * accountId: string,
+ * socketId: string | null (null if disconnected),
+ * lat: number,
+ * lng: number,
+ * destinationLat: number,
+ * destinationLng: number,
+ * destinationName: string,
+ * organizationName: string,
+ * geometry: object (route geometry data),
+ * passengerCount: number,
+ * maxCapacity: number,
+ * lastUpdated: string (ISO timestamp),
+ * lastLat: number (last broadcasted latitude),
+ * lastLng: number (last broadcasted longitude),
+ * lastBroadcastTime: number (timestamp of last broadcast),
+ * disconnected: boolean (true if driver disconnected but in grace period),
+ * disconnectedAt: number | null (timestamp when disconnected, null if connected),
+ * reconnectAttempts: number (number of times driver reconnected within grace period)
+ * } }
+ */
+const drivers = {};
  /**
   * Mapping from socket.id to accountId for quick lookup during cleanup
   * Structure: { socketId: accountId }
@@ -198,25 +214,55 @@
   * * This function is called periodically by setInterval (see CLEANUP_INTERVAL).
   * * @returns {void}
   */
- function cleanupStaleDrivers() {
-   const now = Date.now();
-   let cleaned = 0;
-   for (const [accountId, driver] of Object.entries(drivers)) {
-     const timeSinceUpdate = now - new Date(driver.lastUpdated).getTime();
-     // Remove driver if they haven't sent an update in the timeout period
-     if (timeSinceUpdate > STALE_DRIVER_TIMEOUT) {
-       delete drivers[accountId];
-       if (driver.socketId) {
-         delete socketToAccountId[driver.socketId];
-       }
-       cleaned++;
-     }
-   }
-   
-   if (cleaned > 0 && IS_DEV) {
-     console.log(`🧹 Cleaned up ${cleaned} stale driver(s)`);
-   }
- }
+function cleanupStaleDrivers() {
+  const now = Date.now();
+  let cleaned = 0;
+  for (const [accountId, driver] of Object.entries(drivers)) {
+    const timeSinceUpdate = now - new Date(driver.lastUpdated).getTime();
+    const timeSinceDisconnect = driver.disconnectedAt ? (now - driver.disconnectedAt) : 0;
+    const isDisconnected = driver.disconnected === true;
+    
+    // Remove driver if:
+    // 1. They haven't sent an update in STALE_DRIVER_TIMEOUT (5 minutes), AND
+    // 2. Either:
+    //    - They're not disconnected (no grace period to wait for), OR
+    //    - They're disconnected AND grace period has expired
+    const gracePeriodExpired = isDisconnected && timeSinceDisconnect > DISCONNECT_GRACE_PERIOD;
+    
+    if (timeSinceUpdate > STALE_DRIVER_TIMEOUT) {
+      if (!isDisconnected || gracePeriodExpired) {
+        // Clean up: Remove driver data and socket mapping
+        delete drivers[accountId];
+        if (driver.socketId) {
+          delete socketToAccountId[driver.socketId];
+        }
+        cleaned++;
+        
+        if (IS_DEV) {
+          const reason = isDisconnected ? 
+            `(disconnected ${Math.round(timeSinceDisconnect/1000)}s ago, grace period expired, ${driver.reconnectAttempts || 0} reconnects)` :
+            `(no updates for ${Math.round(timeSinceUpdate/1000)}s)`;
+          log(`🗑️ Cleaned up stale driver ${accountId} ${reason}`);
+        }
+      } else if (IS_DEV) {
+        // Driver is disconnected but still in grace period
+        const remainingTime = Math.round((DISCONNECT_GRACE_PERIOD - timeSinceDisconnect) / 1000);
+        const reconnectCount = driver.reconnectAttempts || 0;
+        log(`⏳ [${accountId}] Disconnected driver in grace period (${remainingTime}s remaining, ${reconnectCount}/${MAX_RECONNECT_ATTEMPTS} reconnects)`);
+      }
+    } else if (isDisconnected && IS_DEV) {
+      // Driver is disconnected but still receiving updates (shouldn't happen, but log for debugging)
+      const remainingTime = Math.round((DISCONNECT_GRACE_PERIOD - timeSinceDisconnect) / 1000);
+      if (remainingTime > 0) {
+        log(`⏳ [${accountId}] Disconnected but has recent updates (${remainingTime}s remaining in grace period)`);
+      }
+    }
+  }
+  
+  if (cleaned > 0 && IS_DEV) {
+    console.log(`🧹 Cleaned up ${cleaned} stale driver(s)`);
+  }
+}
  
  /**
   * Conditional logging function that reduces console spam in production.
@@ -310,15 +356,23 @@ app.get("/health", (req, res) => {
     * Removes 
   the driver from memory and cleans up mappings
     */
-   const cleanup = () => {
-     const accountId = socketToAccountId[socket.id];
-     if (accountId && drivers[accountId]?.socketId === socket.id) {
-       delete drivers[accountId];
-       log(`🗑️ Removed driver ${accountId} on disconnect`);
-     }
-     delete socketToAccountId[socket.id];
-     delete rateLimitMap[socket.id];
-   };
+  const cleanup = () => {
+    const accountId = socketToAccountId[socket.id];
+    if (accountId && drivers[accountId]) {
+      // Check if this socket is the current active socket for this driver
+      if (drivers[accountId].socketId === socket.id) {
+        // Mark as disconnected but keep data for grace period
+        drivers[accountId].disconnected = true;
+        drivers[accountId].disconnectedAt = Date.now();
+        drivers[accountId].socketId = null; // Clear socket ID
+        log(`🔌 [${accountId}] Driver disconnected (grace period: ${DISCONNECT_GRACE_PERIOD/1000}s)`);
+      }
+      // If socket ID doesn't match, it means driver already reconnected with new socket
+      // Just clean up this old socket mapping
+    }
+    delete socketToAccountId[socket.id];
+    delete rateLimitMap[socket.id];
+  };
  
    /**
     * Error handling wrapper for socket event handlers
@@ -398,6 +452,7 @@ app.get("/health", (req, res) => {
           maxCapacity: driver.maxCapacity ?? 0,
           organizationName: driver.organizationName,
           lastUpdated: driver.lastUpdated, // server-only for sorting
+          isOnline: !driver.disconnected, // Include connection status
         }));
 
       const totalDrivers = driversArray.length;
@@ -436,6 +491,7 @@ app.get("/health", (req, res) => {
             passengerCount: driver.passengerCount ?? 0,
             maxCapacity: driver.maxCapacity ?? 0,
             organizationName: driver.organizationName,
+            isOnline: !driver.disconnected, // Include connection status
           }));
 
         socket.emit("currentData", {
@@ -520,6 +576,31 @@ app.get("/health", (req, res) => {
     const prevDriver = drivers[accountId];
     const now = Date.now();
     
+    // Handle reconnection: If driver was disconnected, restore connection
+    if (prevDriver && prevDriver.disconnected) {
+      // Driver is reconnecting
+      const reconnectAttempts = (prevDriver.reconnectAttempts || 0) + 1;
+      const timeDisconnected = prevDriver.disconnectedAt ? (now - prevDriver.disconnectedAt) : 0;
+      
+      // Clear disconnected status
+      prevDriver.disconnected = false;
+      prevDriver.disconnectedAt = null;
+      prevDriver.reconnectAttempts = reconnectAttempts;
+      
+      // Handle socket ID change (driver reconnected with new socket)
+      if (prevDriver.socketId && prevDriver.socketId !== socket.id) {
+        // Clean up old socket mapping
+        delete socketToAccountId[prevDriver.socketId];
+        log(`🔄 [${accountId}] Reconnected (attempt ${reconnectAttempts}/${MAX_RECONNECT_ATTEMPTS}) - Socket changed: ${prevDriver.socketId} → ${socket.id} (was disconnected ${Math.round(timeDisconnected/1000)}s)`);
+      } else {
+        log(`🔄 [${accountId}] Reconnected (attempt ${reconnectAttempts}/${MAX_RECONNECT_ATTEMPTS}) - Data preserved (was disconnected ${Math.round(timeDisconnected/1000)}s)`);
+      }
+    } else if (prevDriver && prevDriver.socketId && prevDriver.socketId !== socket.id) {
+      // Socket ID changed but driver wasn't marked as disconnected (edge case)
+      delete socketToAccountId[prevDriver.socketId];
+      log(`🔄 [${accountId}] Socket ID changed: ${prevDriver.socketId} → ${socket.id}`);
+    }
+    
     // Check if coordinates changed (for logging movement)
     // Note: We compare against last BROADCASTED location for movement detection
      
@@ -584,7 +665,10 @@ app.get("/health", (req, res) => {
        maxCapacity: maxCapacity ?? prevDriver?.maxCapacity ??
   0,
        lastUpdated: new Date().toISOString(),
-       socketId: socket.id,
+       socketId: socket.id, // Update socket ID (handles reconnections)
+       disconnected: false, // Ensure driver is marked as connected when receiving updates
+       disconnectedAt: null, // Clear disconnect timestamp
+       reconnectAttempts: prevDriver?.reconnectAttempts || 0, // Preserve reconnect attempts count
        // Only update lastLat/lastLng when we broadcast (these represent last broadcasted location)
        lastLat: shouldBroadcast ?
   lat : (prevDriver?.lastLat ?? lat),
@@ -606,6 +690,8 @@ app.get("/health", (req, res) => {
          destinationLng: drivers[accountId].destinationLng,
          passengerCount: drivers[accountId].passengerCount,
          maxCapacity: drivers[accountId].maxCapacity,
+         lastUpdated: drivers[accountId].lastUpdated, // Include timestamp for freshness tracking
+         isOnline: true, // Driver is online (receiving updates)
        };
        
        io.to("user").emit("locationUpdate", broadcastData);
@@ -643,10 +729,22 @@ app.get("/health", (req, res) => {
        socket.emit("error", { message: "Missing accountId" });
        return;
      }
- 
+
      const { accountId, destinationName, destinationLat, destinationLng } = data;
      const prev = drivers[accountId] || {};
- 
+     
+     // Handle reconnection if driver was disconnected
+     if (prev.disconnected) {
+       const reconnectAttempts = (prev.reconnectAttempts || 0) + 1;
+       prev.disconnected = false;
+       prev.disconnectedAt = null;
+       prev.reconnectAttempts = reconnectAttempts;
+       if (prev.socketId && prev.socketId !== socket.id) {
+         delete socketToAccountId[prev.socketId];
+       }
+       log(`🔄 [${accountId}] Reconnected via destinationUpdate (attempt ${reconnectAttempts}/${MAX_RECONNECT_ATTEMPTS})`);
+     }
+
      // Update driver data with new destination
      drivers[accountId] = {
        ...prev,
@@ -657,6 +755,8 @@ app.get("/health", (req, res) => {
        destinationLng: destinationLng ?? prev.destinationLng,
        lastUpdated: new Date().toISOString(),
        socketId: socket.id,
+       disconnected: false,
+       disconnectedAt: null,
      };
      socketToAccountId[socket.id] = accountId;
  
@@ -698,7 +798,19 @@ app.get("/health", (req, res) => {
  
      const { accountId, geometry, destinationLat, destinationLng } = data;
      const prev = drivers[accountId] || {};
- 
+     
+     // Handle reconnection if driver was disconnected
+     if (prev.disconnected) {
+       const reconnectAttempts = (prev.reconnectAttempts || 0) + 1;
+       prev.disconnected = false;
+       prev.disconnectedAt = null;
+       prev.reconnectAttempts = reconnectAttempts;
+       if (prev.socketId && prev.socketId !== socket.id) {
+         delete socketToAccountId[prev.socketId];
+       }
+       log(`🔄 [${accountId}] Reconnected via routeUpdate (attempt ${reconnectAttempts}/${MAX_RECONNECT_ATTEMPTS})`);
+     }
+
      // Update driver data with new route
      drivers[accountId] = {
        ...prev,
@@ -709,6 +821,8 @@ app.get("/health", (req, res) => {
   
        lastUpdated: new Date().toISOString(),
        socketId: socket.id,
+       disconnected: false,
+       disconnectedAt: null,
      };
      socketToAccountId[socket.id] = accountId;
  
@@ -752,13 +866,25 @@ app.get("/health", (req, res) => {
      const { accountId, passengerCount, maxCapacity } = data;
      const prev = drivers[accountId] || {};
      
+     // Handle reconnection if driver was disconnected
+     if (prev.disconnected) {
+       const reconnectAttempts = (prev.reconnectAttempts || 0) + 1;
+       prev.disconnected = false;
+       prev.disconnectedAt = null;
+       prev.reconnectAttempts = reconnectAttempts;
+       if (prev.socketId && prev.socketId !== socket.id) {
+         delete socketToAccountId[prev.socketId];
+       }
+       log(`🔄 [${accountId}] Reconnected via passengerUpdate (attempt ${reconnectAttempts}/${MAX_RECONNECT_ATTEMPTS})`);
+     }
+     
      // Normalize values (use previous values if not provided)
      const newPassengerCount = passengerCount ?? prev.passengerCount ?? 0;
      const newMaxCapacity = maxCapacity ?? prev.maxCapacity ?? 0;
      const prevPassengerCount = prev.passengerCount ?? 0;
      const prevMaxCapacity = prev.maxCapacity ??
   0;
- 
+
      // Check if values actually changed
      const passengerCountChanged = newPassengerCount !== prevPassengerCount;
      const maxCapacityChanged = newMaxCapacity !== prevMaxCapacity;
@@ -771,6 +897,8 @@ app.get("/health", (req, res) => {
        maxCapacity: newMaxCapacity,
        lastUpdated: new Date().toISOString(),
        socketId: socket.id,
+       disconnected: false,
+       disconnectedAt: null,
      };
      socketToAccountId[socket.id] = accountId;
  
@@ -884,6 +1012,7 @@ app.get("/health", (req, res) => {
          maxCapacity: driver.maxCapacity ?? 0,
          organizationName: driver.organizationName,
          lastUpdated: driver.lastUpdated, // Used for sorting
+         isOnline: !driver.disconnected, // Include connection status
        }));
  
      // Limit snapshot size if configured (optimization for many drivers)
