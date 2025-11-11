@@ -359,6 +359,8 @@ io.on("connection", (socket) => {
     log(`🆔 ${socket.id} registered as ${role}`);
 
     if (role === "user") {
+      }
+}));
   /**
    * OPTIMIZATION: Batch all driver data into a single message.
    * Instead of sending multiple individual events, we send one
