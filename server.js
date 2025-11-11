@@ -359,62 +359,83 @@ io.on("connection", (socket) => {
     log(`🆔 ${socket.id} registered as ${role}`);
 
     if (role === "user") {
-      /**
-       * OPTIMIZATION: Batch all driver data into a single message
-    
-       * Instead of sending multiple individual events, we send one
-       * driversSnapshot event with all driver data.
- This reduces
-       * network overhead and improves performance.
- * * OPTIMIZATION: Limit snapshot size to prevent huge payloads
-       * when there are many drivers.
- If MAX_SNAPSHOT_DRIVERS is set,
-       * only send the most recently updated drivers.
- * * NOTE: lastUpdated is included temporarily for sorting purposes only.
- * It's stored server-side for cleanup but NOT sent to clients in the snapshot.
- * (It IS sent in getBusInfo response if needed)
-       */
-      let driversArray = Object.values(drivers)
-        .filter(driver => driver.accountId && (driver.lat || driver.geometry))
-        .map(driver => ({
-          accountId: driver.accountId,
-          lat: driver.lat,
-          lng: driver.lng,
-          geometry: driver.geometry,
-        
-          destinationName: driver.destinationName,
-          destinationLat: driver.destinationLat,
-          destinationLng: driver.destinationLng,
-          passengerCount: driver.passengerCount ?? 0,
-          maxCapacity: driver.maxCapacity ?? 0,
-          organizationName: driver.organizationName,
-          lastUpdated: driver.lastUpdated, // Server-only: Used for sorting, removed before sending
-        }));
-// Limit snapshot size if configured (optimization for many drivers)
-      const totalDrivers = driversArray.length;
-      if (MAX_SNAPSHOT_DRIVERS > 0 && driversArray.length > MAX_SNAPSHOT_DRIVERS) {
-        // Sort by lastUpdated (most recent first) and take top N
-        driversArray = driversArray
-          .sort((a, b) => new Date(b.lastUpdated || 0) - new Date(a.lastUpdated || 0))
-          .slice(0, MAX_SNAPSHOT_DRIVERS)
-          .map(({ lastUpdated, ...driver }) => driver);
-// Remove lastUpdated - server-only field
-        log(`⚠️ Snapshot limited to ${MAX_SNAPSHOT_DRIVERS} of ${totalDrivers} drivers`);
-      } else {
-        // Remove lastUpdated before sending to client (server-only field)
-        driversArray = driversArray.map(({ lastUpdated, ...driver }) => driver);
-      }
+  /**
+   * OPTIMIZATION: Batch all driver data into a single message.
+   * Instead of sending multiple individual events, we send one
+   * driversSnapshot event with all driver data.
+   * This reduces network overhead and improves performance.
+   *
+   * OPTIMIZATION: Limit snapshot size to prevent huge payloads
+   * when there are many drivers.
+   * If MAX_SNAPSHOT_DRIVERS is set, only send the most recently updated drivers.
+   *
+   * NOTE: lastUpdated is included temporarily for sorting purposes only.
+   * It's stored server-side for cleanup but NOT sent to clients in the snapshot.
+   */
+  let driversArray = Object.values(drivers)
+    .filter(driver => driver.accountId && (driver.lat || driver.geometry))
+    .map(driver => ({
+      accountId: driver.accountId,
+      lat: driver.lat,
+      lng: driver.lng,
+      geometry: driver.geometry,
+      destinationName: driver.destinationName,
+      destinationLat: driver.destinationLat,
+      destinationLng: driver.destinationLng,
+      passengerCount: driver.passengerCount ?? 0,
+      maxCapacity: driver.maxCapacity ?? 0,
+      organizationName: driver.organizationName,
+      lastUpdated: driver.lastUpdated, // server-only for sorting
+    }));
 
-      // Send batched data in a single emit
-      socket.emit("driversSnapshot", {
-        drivers: driversArray,
-        count: driversArray.length,
-        total: totalDrivers, // Total drivers available (useful if limited)
-        limited: MAX_SNAPSHOT_DRIVERS > 0 && totalDrivers > MAX_SNAPSHOT_DRIVERS,
-      });
-      log(`📤 Sent snapshot of ${driversArray.length} driver(s) to user ${socket.id}${totalDrivers > driversArray.length ? ` (${totalDrivers} total available)` : ''}`);
-    }
-  }));
+  const totalDrivers = driversArray.length;
+
+  // Limit snapshot size if configured (optimization for many drivers)
+  if (MAX_SNAPSHOT_DRIVERS > 0 && totalDrivers > MAX_SNAPSHOT_DRIVERS) {
+    driversArray = driversArray
+      .sort((a, b) => new Date(b.lastUpdated || 0) - new Date(a.lastUpdated || 0))
+      .slice(0, MAX_SNAPSHOT_DRIVERS)
+      .map(({ lastUpdated, ...driver }) => driver);
+    log(`⚠️ Snapshot limited to ${MAX_SNAPSHOT_DRIVERS} of ${totalDrivers} drivers`);
+  } else {
+    driversArray = driversArray.map(({ lastUpdated, ...driver }) => driver);
+  }
+
+  // ✅ Send the standard driver snapshot (existing logic)
+  socket.emit("driversSnapshot", {
+    drivers: driversArray,
+    count: driversArray.length,
+    total: totalDrivers,
+    limited: MAX_SNAPSHOT_DRIVERS > 0 && totalDrivers > MAX_SNAPSHOT_DRIVERS,
+  });
+
+  // ✅ FIX: ensure late joiners immediately receive the full current driver data
+  try {
+    const lateJoinSnapshot = Object.values(drivers)
+      .filter(driver => driver.accountId && (driver.lat || driver.geometry))
+      .map(driver => ({
+        accountId: driver.accountId,
+        lat: driver.lat,
+        lng: driver.lng,
+        geometry: driver.geometry,
+        destinationName: driver.destinationName,
+        destinationLat: driver.destinationLat,
+        destinationLng: driver.destinationLng,
+        passengerCount: driver.passengerCount ?? 0,
+        maxCapacity: driver.maxCapacity ?? 0,
+        organizationName: driver.organizationName,
+      }));
+
+    socket.emit("currentData", {
+      buses: lateJoinSnapshot,
+    });
+
+    log(`📤 Late joiner snapshot sent: ${lateJoinSnapshot.length} active driver(s) to user ${socket.id}`);
+  } catch (err) {
+    log(`❌ Error sending late joiner snapshot to ${socket.id}:`, err);
+  }
+}
+
 
   // --- LOCATION UPDATES (Driver → Server → Users) ---
   /**
