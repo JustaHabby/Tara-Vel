@@ -777,16 +777,17 @@ app.get("/health", (req, res) => {
    /**
     * routeUpdate Event Handler
     * * Drivers send this event when they update their route geometry.
-  * Route geometry is typically a polyline or set of coordinates representing
+    * Route geometry is typically a polyline or set of coordinates representing
     * the planned route.
-  This is immediately broadcast to all users.
-    * * @event routeUpdate
+    * * OPTIMIZATION: Only broadcasts and logs when route geometry or destination actually changes.
+    * This prevents spam when the app sends frequent updates with the same values.
+    * @event routeUpdate
     * @param {object} data - Route data
     * @param {string} data.accountId - Driver account ID
     * @param {object} data.geometry - Route geometry data (polyline, coordinates, etc.)
     * @param {number} [data.destinationLat] - Destination latitude
     * @param {number} [data.destinationLng] - Destination longitude
-    * * @emits routeUpdate - Broadcast to all users
+    * @emits routeUpdate - Broadcast to all users (only if route changed)
     * @emits error - Sent to client if accountId is missing
     */
    socket.on("routeUpdate", safeHandler("routeUpdate", (data) => {
@@ -796,48 +797,66 @@ app.get("/health", (req, res) => {
        return;
      }
  
-     const { accountId, geometry, destinationLat, destinationLng } = data;
-     const prev = drivers[accountId] || {};
-     
-     // Handle reconnection if driver was disconnected
-     if (prev.disconnected) {
-       const reconnectAttempts = (prev.reconnectAttempts || 0) + 1;
-       prev.disconnected = false;
-       prev.disconnectedAt = null;
-       prev.reconnectAttempts = reconnectAttempts;
-       if (prev.socketId && prev.socketId !== socket.id) {
-         delete socketToAccountId[prev.socketId];
-       }
-       log(`🔄 [${accountId}] Reconnected via routeUpdate (attempt ${reconnectAttempts}/${MAX_RECONNECT_ATTEMPTS})`);
-     }
+    const { accountId, geometry, destinationLat, destinationLng } = data;
+    const prev = drivers[accountId] || {};
+    
+    // Handle reconnection if driver was disconnected
+    if (prev.disconnected) {
+      const reconnectAttempts = (prev.reconnectAttempts || 0) + 1;
+      prev.disconnected = false;
+      prev.disconnectedAt = null;
+      prev.reconnectAttempts = reconnectAttempts;
+      if (prev.socketId && prev.socketId !== socket.id) {
+        delete socketToAccountId[prev.socketId];
+      }
+      log(`🔄 [${accountId}] Reconnected via routeUpdate (attempt ${reconnectAttempts}/${MAX_RECONNECT_ATTEMPTS})`);
+    }
 
-     // Update driver data with new route
-     drivers[accountId] = {
-       ...prev,
-       accountId,
-       geometry,
-       destinationLat: destinationLat ?? prev.destinationLat,
-       destinationLng: destinationLng ?? prev.destinationLng,
-  
-       lastUpdated: new Date().toISOString(),
-       socketId: socket.id,
-       disconnected: false,
-       disconnectedAt: null,
-     };
-     socketToAccountId[socket.id] = accountId;
- 
-     // Immediately broadcast route update to all users
-     io.to("user").emit("routeUpdate", {
-       from: "driver",
-       accountId,
-       geometry,
-       destinationName: drivers[accountId].destinationName,
-       destinationLat: drivers[accountId].destinationLat,
-       destinationLng: drivers[accountId].destinationLng,
-       passengerCount: drivers[accountId].passengerCount ?? 0,
-       maxCapacity: drivers[accountId].maxCapacity ?? 0,
-     });
-     log(`🗺️ [${accountId}] Route updated`);
+    // Check if route data actually changed
+    const prevGeometry = prev.geometry;
+    const geometryChanged = JSON.stringify(geometry) !== JSON.stringify(prevGeometry);
+    const destinationLatChanged = destinationLat !== undefined && destinationLat !== prev.destinationLat;
+    const destinationLngChanged = destinationLng !== undefined && destinationLng !== prev.destinationLng;
+    const routeChanged = geometryChanged || destinationLatChanged || destinationLngChanged;
+
+    // Always update driver data in memory (for getBusInfo requests)
+    drivers[accountId] = {
+      ...prev,
+      accountId,
+      geometry,
+      destinationLat: destinationLat ?? prev.destinationLat,
+      destinationLng: destinationLng ?? prev.destinationLng,
+      lastUpdated: new Date().toISOString(),
+      socketId: socket.id,
+      disconnected: false,
+      disconnectedAt: null,
+    };
+    socketToAccountId[socket.id] = accountId;
+
+    // Only broadcast and log if route actually changed
+    // This prevents spam when app sends frequent updates with same values
+    if (routeChanged) {
+      // Broadcast route update to all users
+      io.to("user").emit("routeUpdate", {
+        from: "driver",
+        accountId,
+        geometry,
+        destinationName: drivers[accountId].destinationName,
+        destinationLat: drivers[accountId].destinationLat,
+        destinationLng: drivers[accountId].destinationLng,
+        passengerCount: drivers[accountId].passengerCount ?? 0,
+        maxCapacity: drivers[accountId].maxCapacity ?? 0,
+      });
+      
+      // Log polyline change
+      if (geometryChanged && geometry) {
+        const polylineStr = typeof geometry === "string" ? geometry : JSON.stringify(geometry);
+        log(`🗺️ [${accountId}] Route updated | Polyline changed: ${polylineStr}`);
+      } else {
+        log(`🗺️ [${accountId}] Route updated`);
+      }
+    }
+    // If route didn't change, we silently update the data store without broadcasting/logging
    }));
  
    // --- PASSENGER COUNT UPDATE ---
@@ -1171,5 +1190,4 @@ function gracefulShutdown(signal) {
 // Handle SIGTERM (production deployments, Docker, etc.)
 process.on("SIGTERM", () => gracefulShutdown("SIGTERM"));
 
-// Handle SIGINT (Ctrl+C in development)
-process.on("SIGINT", () => gracefulShutdown("SIGINT"));
+// Hand... (1 KB left)
