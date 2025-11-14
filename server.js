@@ -1189,4 +1189,14 @@ function gracefulShutdown(signal) {
 }
 
 // Handle SIGTERM (production deployments, Docker, etc.)
-process.on("SIGTE... (1 KB left)
+// Handle graceful shutdown on SIGTERM and SIGINT
+process.on("SIGTERM", () => {
+  console.log("SIGTERM received. Shutting down gracefully...");
+  process.exit(0);
+});
+
+process.on("SIGINT", () => {
+  console.log("SIGINT received. Shutting down gracefully...");
+  process.exit(0);
+});
+
