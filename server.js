@@ -848,11 +848,9 @@ app.get("/health", (req, res) => {
         maxCapacity: drivers[accountId].maxCapacity ?? 0,
       });
       
-      // Log polyline change
+      // Log route update
       if (geometryChanged && geometry) {
-        const polylineStr = typeof geometry === "string" ? geometry : JSON.stringify(geometry);
-        const preview = polylineStr.substring(0, 5);
-        log(`🗺️ [${accountId}] Route updated | Polyline changed: ${preview}`);
+        log(`🗺️ [${accountId}] Route updated | Polyline changed`);
       } else {
         log(`🗺️ [${accountId}] Route updated`);
       }
@@ -1189,14 +1187,7 @@ function gracefulShutdown(signal) {
 }
 
 // Handle SIGTERM (production deployments, Docker, etc.)
-// Handle graceful shutdown on SIGTERM and SIGINT
-process.on("SIGTERM", () => {
-  console.log("SIGTERM received. Shutting down gracefully...");
-  process.exit(0);
-});
+process.on("SIGTERM", () => gracefulShutdown("SIGTERM"));
 
-process.on("SIGINT", () => {
-  console.log("SIGINT received. Shutting down gracefully...");
-  process.exit(0);
-});
-
+// Handle SIGINT (Ctrl+C in development)
+process.on("SIGINT", () => gracefulShutdown("SIGINT"));
