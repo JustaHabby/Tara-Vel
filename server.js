@@ -851,7 +851,8 @@ app.get("/health", (req, res) => {
       // Log polyline change
       if (geometryChanged && geometry) {
         const polylineStr = typeof geometry === "string" ? geometry : JSON.stringify(geometry);
-        log(`🗺️ [${accountId}] Route updated | Polyline changed: ${polylineStr}`);
+        const preview = polylineStr.substring(0, 5);
+        log(`🗺️ [${accountId}] Route updated | Polyline changed: ${preview}`);
       } else {
         log(`🗺️ [${accountId}] Route updated`);
       }
@@ -1188,6 +1189,4 @@ function gracefulShutdown(signal) {
 }
 
 // Handle SIGTERM (production deployments, Docker, etc.)
-process.on("SIGTERM", () => gracefulShutdown("SIGTERM"));
-
-// Hand... (1 KB left)
+process.on("SIGTE... (1 KB left)
