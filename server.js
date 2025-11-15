@@ -2,7 +2,7 @@
  * ===============================
  * 🚌 Real-Time Bus Tracking Server (Relay + On-Demand Info)
  * ===============================
- * @version 9.1.0
+ * @version 9.1.1
  * @author TaraVel Team
  */
 
@@ -500,18 +500,36 @@ io.on("connection", (socket) => {
     safeHandler("registerRole", (data) => {
       let role, accountId;
       
+      // Debug: Log raw data to understand structure
+      if (IS_DEV) {
+        log(`🔍 [DEBUG] registerRole received from ${socket.id}: ${JSON.stringify(data)} (type: ${typeof data})`);
+      }
+      
+      // Handle different data formats
       if (typeof data === "string") {
         role = data;
       } else if (data && typeof data === "object") {
-        role = data.role;
-        accountId = data.accountId;
+        // Extract role and accountId, handling both direct properties and nested structures
+        role = data.role || data["role"];
+        accountId = data.accountId || data["accountId"];
+        
+        // Normalize role to string and trim whitespace
+        if (role != null) {
+          role = String(role).trim();
+        }
+        
+        // Debug: Log extracted values
+        if (IS_DEV) {
+          log(`🔍 [DEBUG] Extracted role: "${role}" (type: ${typeof role}), accountId: "${accountId}"`);
+        }
       } else {
-        log(`⚠️ Invalid registerRole data from ${socket.id}`);
+        log(`⚠️ Invalid registerRole data from ${socket.id}: ${JSON.stringify(data)}`);
         return;
       }
 
-      if (role !== "user" && role !== "driver") {
-        log(`⚠️ Unknown role from ${socket.id}: ${role}`);
+      // Validate role (check for null, undefined, or invalid values)
+      if (!role || typeof role !== "string" || (role !== "user" && role !== "driver")) {
+        log(`⚠️ Unknown role from ${socket.id}: "${role}" (type: ${typeof role}) | Data: ${JSON.stringify(data)}`);
         return;
       }
 
