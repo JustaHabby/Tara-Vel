@@ -1266,7 +1266,11 @@ io.on("connection", (socket) => {
     cleanup();
   });
   socket.on("error", (error) => {
-    log(`❌ Socket error for ${socket.id}: ${error.message}`, "error");
+    const errorMessage = error?.message || error?.toString() || String(error) || "Unknown error";
+    log(`❌ Socket error for ${socket.id}: ${errorMessage}`, "error");
+    if (error && typeof error === "object") {
+      log(`   Error details: ${JSON.stringify(error)}`, "error");
+    }
     cleanup();
   });
 });
