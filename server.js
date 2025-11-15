@@ -2,7 +2,7 @@
  * ===============================
  * 🚌 Real-Time Bus Tracking Server (Relay + On-Demand Info)
  * ===============================
- * @version 9.0.0
+ * @version 9.1.0
  * @author TaraVel Team
  */
 
@@ -46,6 +46,10 @@ const socketToAccountId = {};
 const rateLimitMap = {};
 const users = {};
 const accountIdToSocketId = {};
+// Session management for duplicate connection prevention
+const sessionKeyToSocketId = {}; // Maps sessionKey -> socketId
+const socketIdToSessionKey = {}; // Maps socketId -> sessionKey
+const sessions = {}; // Maps sessionKey -> { accountId, role, createdAt, lastActivity }
 
 // ========== HELPER FUNCTIONS ==========
 
@@ -254,19 +258,39 @@ function validateLocationData(data) {
   return true;
 }
 
-function disconnectOldSocket(oldSocketId, accountId, role) {
+/**
+ * Generate a unique session key
+ */
+function generateSessionKey(accountId) {
+  const timestamp = Date.now();
+  const random = Math.random().toString(36).substring(2, 15);
+  return accountId ? `${accountId}-${timestamp}-${random}` : `${timestamp}-${random}`;
+}
+
+/**
+ * Disconnect an old socket connection
+ */
+function disconnectOldSocket(oldSocketId, accountId, role, reason = "new connection established") {
   if (!oldSocketId) return false;
   
   const oldSocket = io.sockets.sockets.get(oldSocketId);
   if (oldSocket && oldSocket.connected) {
     oldSocket.emit("connectionReplaced", {
-      message: "A new connection was established for your account. This connection is being closed.",
+      message: `A new connection was established for your account. This connection is being closed. Reason: ${reason}`,
       timestamp: new Date().toISOString()
     });
     
     oldSocket.disconnect(true);
     
-    log(`🔌 [${accountId}] Disconnected old ${role} socket ${oldSocketId} (new connection established)`);
+    // Clean up session mappings
+    const oldSessionKey = socketIdToSessionKey[oldSocketId];
+    if (oldSessionKey) {
+      delete sessionKeyToSocketId[oldSessionKey];
+      delete socketIdToSessionKey[oldSocketId];
+      delete sessions[oldSessionKey];
+    }
+    
+    log(`🔌 [${accountId || 'unknown'}] Disconnected old ${role} socket ${oldSocketId} (${reason})`);
     return true;
   }
   return false;
@@ -294,11 +318,11 @@ io.on("connection", (socket) => {
 
   /**
   * Cleanup function called when a socket disconnects
-  * Removes 
-the driver from memory and cleans up mappings
+  * Removes the driver from memory and cleans up mappings
   */
   const cleanup = () => {
     const accountId = socketToAccountId[socket.id];
+    const sessionKey = socketIdToSessionKey[socket.id];
     
     if (accountId && drivers[accountId]) {
       if (drivers[accountId].socketId === socket.id) {
@@ -332,6 +356,14 @@ the driver from memory and cleans up mappings
       }
     }
     
+    // Clean up session mappings
+    if (sessionKey) {
+      if (sessionKeyToSocketId[sessionKey] === socket.id) {
+        delete sessionKeyToSocketId[sessionKey];
+      }
+      delete sessions[sessionKey];
+    }
+    delete socketIdToSessionKey[socket.id];
     delete socketToAccountId[socket.id];
     delete rateLimitMap[socket.id];
   };
@@ -349,6 +381,114 @@ the driver from memory and cleans up mappings
       }
     };
   };
+
+  // --- SESSION RESUMPTION ---
+  /**
+   * resumeSession Event Handler
+   * Allows clients to resume an existing session to prevent duplicate connections
+   */
+  socket.on(
+    "resumeSession",
+    safeHandler("resumeSession", (sessionKey) => {
+      if (!sessionKey || typeof sessionKey !== "string") {
+        log(`⚠️ Invalid resumeSession request from ${socket.id}`);
+        socket.emit("error", { message: "Invalid session key" });
+        return;
+      }
+
+      const existingSession = sessions[sessionKey];
+      if (!existingSession) {
+        log(`⚠️ Session ${sessionKey} not found, falling back to registerRole`);
+        // Session not found, treat as new connection
+        socket.emit("error", { message: "Session not found. Please register again." });
+        return;
+      }
+
+      // Check if there's an old socket with this sessionKey
+      const oldSocketId = sessionKeyToSocketId[sessionKey];
+      if (oldSocketId && oldSocketId !== socket.id) {
+        // Disconnect the old socket with same sessionKey
+        disconnectOldSocket(oldSocketId, existingSession.accountId, existingSession.role, "session resumed on new connection");
+      }
+
+      // Update session mappings
+      sessionKeyToSocketId[sessionKey] = socket.id;
+      socketIdToSessionKey[socket.id] = sessionKey;
+      
+      // Update session activity
+      existingSession.lastActivity = Date.now();
+      sessions[sessionKey] = existingSession;
+
+      // Restore accountId mapping if available
+      if (existingSession.accountId) {
+        const oldSocketIdByAccount = accountIdToSocketId[existingSession.accountId];
+        if (oldSocketIdByAccount && oldSocketIdByAccount !== socket.id) {
+          disconnectOldSocket(oldSocketIdByAccount, existingSession.accountId, existingSession.role, "session resumed");
+        }
+        accountIdToSocketId[existingSession.accountId] = socket.id;
+        socketToAccountId[socket.id] = existingSession.accountId;
+      }
+
+      // Set role and join room
+      socket.role = existingSession.role;
+      socket.join(existingSession.role);
+
+      log(`🔄 [${socket.id}] Session resumed: ${sessionKey} (${existingSession.role}${existingSession.accountId ? `, ${existingSession.accountId}` : ""})`);
+
+      // Send drivers snapshot if user
+      if (existingSession.role === "user") {
+        const userAccountId = existingSession.accountId;
+        if (userAccountId && users[userAccountId]) {
+          users[userAccountId].lastActivity = Date.now();
+          users[userAccountId].socketId = socket.id;
+          users[userAccountId].disconnected = false;
+          users[userAccountId].disconnectedAt = null;
+        }
+
+        let driversArray = Object.values(drivers)
+          .filter(
+            (driver) => driver.accountId && (driver.lat || driver.geometry)
+          )
+          .map((driver) => ({
+            accountId: driver.accountId,
+            lat: driver.lat,
+            lng: driver.lng,
+            geometry: driver.geometry,
+            destinationName: driver.destinationName,
+            destinationLat: driver.destinationLat,
+            destinationLng: driver.destinationLng,
+            passengerCount: driver.passengerCount ?? 0,
+            maxCapacity: driver.maxCapacity ?? 0,
+            organizationName: driver.organizationName,
+            lastUpdated: driver.lastUpdated,
+            isOnline: !driver.disconnected,
+          }));
+
+        const totalDrivers = driversArray.length;
+        if (MAX_SNAPSHOT_DRIVERS > 0 && totalDrivers > MAX_SNAPSHOT_DRIVERS) {
+          driversArray = driversArray
+            .sort(
+              (a, b) =>
+                new Date(b.lastUpdated || 0) - new Date(a.lastUpdated || 0)
+            )
+            .slice(0, MAX_SNAPSHOT_DRIVERS)
+            .map(({ lastUpdated, ...driver }) => driver);
+        } else {
+          driversArray = driversArray.map(
+            ({ lastUpdated, ...driver }) => driver
+          );
+        }
+
+        socket.emit("driversSnapshot", {
+          drivers: driversArray,
+          count: driversArray.length,
+          total: totalDrivers,
+          limited:
+            MAX_SNAPSHOT_DRIVERS > 0 && totalDrivers > MAX_SNAPSHOT_DRIVERS,
+        });
+      }
+    })
+  );
 
   // --- ROLE REGISTRATION ---
   /**
@@ -380,14 +520,35 @@ the driver from memory and cleans up mappings
         return;
       }
 
+      // Generate new session key
+      const sessionKey = generateSessionKey(accountId);
+      const now = Date.now();
+
+      // Check for old socket with same accountId
       if (accountId) {
         const oldSocketId = accountIdToSocketId[accountId];
         if (oldSocketId && oldSocketId !== socket.id) {
-          disconnectOldSocket(oldSocketId, accountId, role);
+          disconnectOldSocket(oldSocketId, accountId, role, "new registration with same accountId");
         }
         accountIdToSocketId[accountId] = socket.id;
         socketToAccountId[socket.id] = accountId;
       }
+
+      // Check if there's an old session with same sessionKey (shouldn't happen, but safety check)
+      const oldSocketIdBySession = sessionKeyToSocketId[sessionKey];
+      if (oldSocketIdBySession && oldSocketIdBySession !== socket.id) {
+        disconnectOldSocket(oldSocketIdBySession, accountId, role, "session key collision");
+      }
+
+      // Create and store session
+      sessions[sessionKey] = {
+        accountId: accountId || null,
+        role: role,
+        createdAt: now,
+        lastActivity: now
+      };
+      sessionKeyToSocketId[sessionKey] = socket.id;
+      socketIdToSessionKey[socket.id] = sessionKey;
 
       socket.role = role;
       socket.join(role);
@@ -396,10 +557,12 @@ the driver from memory and cleans up mappings
         delete rateLimitMap[socket.id];
       }
 
-      log(`🆔 ${socket.id} registered as ${role}${accountId ? ` (${accountId})` : ""}`);
+      // Emit sessionAssigned event to client
+      socket.emit("sessionAssigned", sessionKey);
+
+      log(`🆔 ${socket.id} registered as ${role}${accountId ? ` (${accountId})` : ""} with session ${sessionKey}`);
 
       if (role === "user") {
-        const now = Date.now();
         users[accountId] = {
           accountId,
           socketId: socket.id,
@@ -1006,6 +1169,75 @@ the driver from memory and cleans up mappings
 
       log(
         `📤 Sent requested snapshot of ${driversArray.length} driver(s) to user ${socket.id}`
+      );
+    })
+  );
+
+  // --- USER REQUEST: Ping Driver ---
+  /**
+   * pingDriver Event Handler
+   * 
+   * Users can ping a specific driver to show their location on the driver's map.
+   * The ping appears as a dot/marker on the driver's map at the user's location.
+   * Only sent to the specific driver (not broadcasted to all drivers).
+   */
+  socket.on(
+    "pingDriver",
+    safeHandler("pingDriver", (data) => {
+      const userAccountId = socketToAccountId[socket.id];
+      if (userAccountId && users[userAccountId]) {
+        users[userAccountId].lastActivity = Date.now();
+      }
+
+      const { driverAccountId, lat, lng, passengerCount, userAccountId: pingUserAccountId } = data || {};
+
+      // Validate required fields
+      if (!driverAccountId) {
+        socket.emit("error", { message: "Missing driverAccountId" });
+        return;
+      }
+
+      if (lat === undefined || lng === undefined || lat === null || lng === null) {
+        socket.emit("error", { message: "Missing user location (lat, lng)" });
+        return;
+      }
+
+      // Validate passenger count (default to 1 if not provided)
+      const validPassengerCount = passengerCount !== undefined && passengerCount !== null 
+        ? Math.max(1, Math.floor(Number(passengerCount))) 
+        : 1;
+
+      // Check if driver exists and is online
+      const driver = drivers[driverAccountId];
+      if (!driver) {
+        socket.emit("error", { message: "Driver not found" });
+        return;
+      }
+
+      if (driver.disconnected || !driver.socketId) {
+        socket.emit("error", { message: "Driver is offline" });
+        return;
+      }
+
+      // Get driver's socket ID
+      const driverSocketId = accountIdToSocketId[driverAccountId] || driver.socketId;
+      if (!driverSocketId) {
+        socket.emit("error", { message: "Driver socket not found" });
+        return;
+      }
+
+      // Send ping ONLY to the specific driver (not broadcasted)
+      io.to(driverSocketId).emit("pingReceived", {
+        from: "user",
+        userAccountId: pingUserAccountId || userAccountId || "unknown",
+        lat: lat,
+        lng: lng,
+        passengerCount: validPassengerCount,
+        timestamp: Date.now(),
+      });
+
+      log(
+        `📍 User ${userAccountId || socket.id} pinged driver ${driverAccountId} at (${lat}, ${lng}) with ${validPassengerCount} passenger(s)`
       );
     })
   );
