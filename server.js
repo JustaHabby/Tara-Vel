@@ -1283,15 +1283,20 @@ io.on("connection", (socket) => {
       }
 
       const { driverAccountId, lat, lng, passengerCount, userAccountId: pingUserAccountId } = data || {};
+      const effectiveUserAccountId = pingUserAccountId || userAccountId || "unknown";
 
       // Validate required fields
       if (!driverAccountId) {
-        socket.emit("error", { message: "Missing driverAccountId" });
+        const errorMsg = "Missing driverAccountId";
+        socket.emit("error", { message: errorMsg });
+        log(`❌ User ${effectiveUserAccountId} failed to ping driver: ${errorMsg}`, "error");
         return;
       }
 
       if (lat === undefined || lng === undefined || lat === null || lng === null) {
-        socket.emit("error", { message: "Missing user location (lat, lng)" });
+        const errorMsg = "Missing user location (lat, lng)";
+        socket.emit("error", { message: errorMsg });
+        log(`❌ User ${effectiveUserAccountId} failed to ping driver ${driverAccountId}: ${errorMsg}`, "error");
         return;
       }
 
@@ -1303,35 +1308,114 @@ io.on("connection", (socket) => {
       // Check if driver exists and is online
       const driver = drivers[driverAccountId];
       if (!driver) {
-        socket.emit("error", { message: "Driver not found" });
+        const errorMsg = "Driver not found";
+        socket.emit("error", { message: errorMsg });
+        log(`❌ User ${effectiveUserAccountId} failed to ping driver ${driverAccountId}: ${errorMsg}`, "error");
         return;
       }
 
       if (driver.disconnected || !driver.socketId) {
-        socket.emit("error", { message: "Driver is offline" });
+        const errorMsg = "Driver is offline";
+        socket.emit("error", { message: errorMsg });
+        log(`❌ User ${effectiveUserAccountId} failed to ping driver ${driverAccountId}: ${errorMsg}`, "error");
         return;
       }
 
       // Get driver's socket ID
       const driverSocketId = accountIdToSocketId[driverAccountId] || driver.socketId;
       if (!driverSocketId) {
-        socket.emit("error", { message: "Driver socket not found" });
+        const errorMsg = "Driver socket not found";
+        socket.emit("error", { message: errorMsg });
+        log(`❌ User ${effectiveUserAccountId} failed to ping driver ${driverAccountId}: ${errorMsg}`, "error");
         return;
       }
 
       // Send ping ONLY to the specific driver (not broadcasted)
-      io.to(driverSocketId).emit("pingReceived", {
-        from: "user",
-        userAccountId: pingUserAccountId || userAccountId || "unknown",
-        lat: lat,
-        lng: lng,
-        passengerCount: validPassengerCount,
-        timestamp: Date.now(),
-      });
+      try {
+        io.to(driverSocketId).emit("pingReceived", {
+          from: "user",
+          userAccountId: effectiveUserAccountId,
+          lat: lat,
+          lng: lng,
+          passengerCount: validPassengerCount,
+          timestamp: Date.now(),
+        });
 
-      log(
-        `📍 User ${userAccountId || socket.id} pinged driver ${driverAccountId} at (${lat}, ${lng}) with ${validPassengerCount} passenger(s)`
-      );
+        log(`✅ User ${effectiveUserAccountId} pinged driver ${driverAccountId}`);
+      } catch (error) {
+        const errorMsg = `Failed to send ping: ${error.message}`;
+        socket.emit("error", { message: errorMsg });
+        log(`❌ User ${effectiveUserAccountId} failed to ping driver ${driverAccountId}: ${errorMsg}`, "error");
+      }
+    })
+  );
+
+  // --- USER REQUEST: Unping Driver ---
+  /**
+   * unpingDriver Event Handler
+   * 
+   * Users can unping a driver to remove their ping from the driver's map.
+   * This removes the ping marker that was previously sent to the driver.
+   * Only sent to the specific driver (not broadcasted to all drivers).
+   */
+  socket.on(
+    "unpingDriver",
+    safeHandler("unpingDriver", (data) => {
+      const userAccountId = socketToAccountId[socket.id];
+      if (userAccountId && users[userAccountId]) {
+        users[userAccountId].lastActivity = Date.now();
+      }
+
+      const { driverAccountId, userAccountId: unpingUserAccountId } = data || {};
+      const effectiveUserAccountId = unpingUserAccountId || userAccountId || "unknown";
+
+      // Validate required fields
+      if (!driverAccountId) {
+        const errorMsg = "Missing driverAccountId";
+        socket.emit("error", { message: errorMsg });
+        log(`❌ User ${effectiveUserAccountId} failed to unping driver: ${errorMsg}`, "error");
+        return;
+      }
+
+      // Check if driver exists and is online
+      const driver = drivers[driverAccountId];
+      if (!driver) {
+        const errorMsg = "Driver not found";
+        socket.emit("error", { message: errorMsg });
+        log(`❌ User ${effectiveUserAccountId} failed to unping driver ${driverAccountId}: ${errorMsg}`, "error");
+        return;
+      }
+
+      if (driver.disconnected || !driver.socketId) {
+        const errorMsg = "Driver is offline";
+        socket.emit("error", { message: errorMsg });
+        log(`❌ User ${effectiveUserAccountId} failed to unping driver ${driverAccountId}: ${errorMsg}`, "error");
+        return;
+      }
+
+      // Get driver's socket ID
+      const driverSocketId = accountIdToSocketId[driverAccountId] || driver.socketId;
+      if (!driverSocketId) {
+        const errorMsg = "Driver socket not found";
+        socket.emit("error", { message: errorMsg });
+        log(`❌ User ${effectiveUserAccountId} failed to unping driver ${driverAccountId}: ${errorMsg}`, "error");
+        return;
+      }
+
+      // Send unping ONLY to the specific driver (not broadcasted)
+      try {
+        io.to(driverSocketId).emit("pingRemoved", {
+          from: "user",
+          userAccountId: effectiveUserAccountId,
+          timestamp: Date.now(),
+        });
+
+        log(`✅ User ${effectiveUserAccountId} unpinged driver ${driverAccountId}`);
+      } catch (error) {
+        const errorMsg = `Failed to send unping: ${error.message}`;
+        socket.emit("error", { message: errorMsg });
+        log(`❌ User ${effectiveUserAccountId} failed to unping driver ${driverAccountId}: ${errorMsg}`, "error");
+      }
     })
   );
 
