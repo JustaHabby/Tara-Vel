@@ -2,7 +2,7 @@
  * ===============================
  * 🚌 Real-Time Bus Tracking Server (Relay + On-Demand Info)
  * ===============================
- * @version 9.1.1
+ * @version 10.0.0
  * @author TaraVel Team
  */
 
@@ -435,6 +435,37 @@ io.on("connection", (socket) => {
 
       log(`🔄 [${socket.id}] Session resumed: ${sessionKey} (${existingSession.role}${existingSession.accountId ? `, ${existingSession.accountId}` : ""})`);
 
+      // [NEW] - Send driver state back if driver (restore passenger count, capacity, destination, etc.)
+      if (existingSession.role === "driver" && existingSession.accountId) {
+        const driverAccountId = existingSession.accountId;
+        const existingDriver = drivers[driverAccountId];
+        
+        if (existingDriver) {
+          // Restore driver's socket ID and connection status
+          existingDriver.socketId = socket.id;
+          existingDriver.disconnected = false;
+          existingDriver.disconnectedAt = null;
+          
+          // Send driver state back to client
+          socket.emit("driverStateRestored", {
+            accountId: driverAccountId,
+            passengerCount: existingDriver.passengerCount ?? 0,
+            maxCapacity: existingDriver.maxCapacity ?? 0,
+            destinationName: existingDriver.destinationName,
+            destinationLat: existingDriver.destinationLat,
+            destinationLng: existingDriver.destinationLng,
+            organizationName: existingDriver.organizationName,
+            lat: existingDriver.lat,
+            lng: existingDriver.lng,
+            lastUpdated: existingDriver.lastUpdated
+          });
+          
+          log(`🔄 [${driverAccountId}] Driver state restored: ${existingDriver.passengerCount ?? 0}/${existingDriver.maxCapacity ?? 0} passengers, destination: ${existingDriver.destinationName || "Unknown"}`);
+        } else {
+          log(`⚠️ [${driverAccountId}] Driver not found in memory during session resume`);
+        }
+      }
+
       // Send drivers snapshot if user
       if (existingSession.role === "user") {
         const userAccountId = existingSession.accountId;
@@ -579,6 +610,34 @@ io.on("connection", (socket) => {
       socket.emit("sessionAssigned", sessionKey);
 
       log(`🆔 ${socket.id} registered as ${role}${accountId ? ` (${accountId})` : ""} with session ${sessionKey}`);
+
+      // [NEW] - Send driver state back if driver exists in memory (handles session not found case)
+      if (role === "driver" && accountId) {
+        const existingDriver = drivers[accountId];
+        
+        if (existingDriver) {
+          // Update driver's socket ID and connection status
+          existingDriver.socketId = socket.id;
+          existingDriver.disconnected = false;
+          existingDriver.disconnectedAt = null;
+          
+          // Send driver state back to client
+          socket.emit("driverStateRestored", {
+            accountId: accountId,
+            passengerCount: existingDriver.passengerCount ?? 0,
+            maxCapacity: existingDriver.maxCapacity ?? 0,
+            destinationName: existingDriver.destinationName,
+            destinationLat: existingDriver.destinationLat,
+            destinationLng: existingDriver.destinationLng,
+            organizationName: existingDriver.organizationName,
+            lat: existingDriver.lat,
+            lng: existingDriver.lng,
+            lastUpdated: existingDriver.lastUpdated
+          });
+          
+          log(`🔄 [${accountId}] Driver state restored on registerRole: ${existingDriver.passengerCount ?? 0}/${existingDriver.maxCapacity ?? 0} passengers, destination: ${existingDriver.destinationName || "Unknown"}`);
+        }
+      }
 
       if (role === "user") {
         users[accountId] = {
@@ -766,7 +825,8 @@ io.on("connection", (socket) => {
       // Check if coordinates changed (for logging movement)
       const timeSinceLastBroadcast = prevDriver?.lastBroadcastTime ? now - prevDriver.lastBroadcastTime : Infinity;
 
-      const locationChanged = !prevDriver || !prevDriver.lastLat || prevDriver.lastLng || calculateDistance(lat, lng, prevDriver.lastLat, prevDriver.lastLng) > LOCATION_CHANGE_THRESHOLD;
+      // Fix: Added missing ! before prevDriver.lastLng to properly check if lastLng is missing
+      const locationChanged = !prevDriver || !prevDriver.lastLat || !prevDriver.lastLng || calculateDistance(lat, lng, prevDriver.lastLat, prevDriver.lastLng) > LOCATION_CHANGE_THRESHOLD;
       const passengerDataChanged = passengerCount !== prevDriver?.passengerCount || maxCapacity !== prevDriver?.maxCapacity;
       const isIntervalUpdate = timeSinceLastBroadcast >= LOCATION_UPDATE_INTERVAL;
       const shouldBroadcast = !prevDriver || locationChanged || passengerDataChanged || isIntervalUpdate;
