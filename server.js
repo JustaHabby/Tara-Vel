@@ -2,7 +2,7 @@
  * ===============================
  * 🚌 Real-Time Bus Tracking Server (Relay + On-Demand Info)
  * ===============================
- * @version 10.0.0
+ * @version 10.0.1
  * @author TaraVel Team
  */
 
@@ -50,8 +50,37 @@ const accountIdToSocketId = {};
 const sessionKeyToSocketId = {}; // Maps sessionKey -> socketId
 const socketIdToSessionKey = {}; // Maps socketId -> sessionKey
 const sessions = {}; // Maps sessionKey -> { accountId, role, createdAt, lastActivity }
+// Track drivers that need state restoration after registration (to avoid race condition with stale maxCapacity)
+const pendingStateRestore = new Set(); // Set of accountIds that need state restoration
 
 // ========== HELPER FUNCTIONS ==========
+
+/**
+ * Emit driverStateRestored event if driver is pending restoration
+ * This ensures we have the correct maxCapacity from the client before restoring state
+ */
+function emitDriverStateRestoredIfPending(socket, accountId) {
+  if (pendingStateRestore.has(accountId)) {
+    const driver = drivers[accountId];
+    if (driver) {
+      socket.emit("driverStateRestored", {
+        accountId: accountId,
+        passengerCount: driver.passengerCount ?? 0,
+        maxCapacity: driver.maxCapacity ?? 0,
+        destinationName: driver.destinationName,
+        destinationLat: driver.destinationLat,
+        destinationLng: driver.destinationLng,
+        organizationName: driver.organizationName,
+        lat: driver.lat,
+        lng: driver.lng,
+        lastUpdated: driver.lastUpdated
+      });
+      
+      log(`🔄 [${accountId}] Driver state restored after update: ${driver.passengerCount ?? 0}/${driver.maxCapacity ?? 0} passengers, destination: ${driver.destinationName || "Unknown"}`);
+      pendingStateRestore.delete(accountId);
+    }
+  }
+}
 
 /**
  * Calculate the distance between two coordinates using a simplified Euclidean distance formula.
@@ -435,7 +464,7 @@ io.on("connection", (socket) => {
 
       log(`🔄 [${socket.id}] Session resumed: ${sessionKey} (${existingSession.role}${existingSession.accountId ? `, ${existingSession.accountId}` : ""})`);
 
-      // [NEW] - Send driver state back if driver (restore passenger count, capacity, destination, etc.)
+      // [NEW] - Mark driver for state restoration after first update (avoids race condition with stale maxCapacity)
       if (existingSession.role === "driver" && existingSession.accountId) {
         const driverAccountId = existingSession.accountId;
         const existingDriver = drivers[driverAccountId];
@@ -446,21 +475,11 @@ io.on("connection", (socket) => {
           existingDriver.disconnected = false;
           existingDriver.disconnectedAt = null;
           
-          // Send driver state back to client
-          socket.emit("driverStateRestored", {
-            accountId: driverAccountId,
-            passengerCount: existingDriver.passengerCount ?? 0,
-            maxCapacity: existingDriver.maxCapacity ?? 0,
-            destinationName: existingDriver.destinationName,
-            destinationLat: existingDriver.destinationLat,
-            destinationLng: existingDriver.destinationLng,
-            organizationName: existingDriver.organizationName,
-            lat: existingDriver.lat,
-            lng: existingDriver.lng,
-            lastUpdated: existingDriver.lastUpdated
-          });
-          
-          log(`🔄 [${driverAccountId}] Driver state restored: ${existingDriver.passengerCount ?? 0}/${existingDriver.maxCapacity ?? 0} passengers, destination: ${existingDriver.destinationName || "Unknown"}`);
+          // [FIX] - Don't emit driverStateRestored immediately to avoid race condition with stale maxCapacity
+          // Instead, mark it as pending and emit it after the first passengerCountUpdated or updateLocation event
+          // This ensures we have the correct maxCapacity from the client before restoring state
+          pendingStateRestore.add(driverAccountId);
+          log(`⏳ [${driverAccountId}] Driver session resumed - state restoration pending first update (to ensure correct maxCapacity)`);
         } else {
           log(`⚠️ [${driverAccountId}] Driver not found in memory during session resume`);
         }
@@ -611,7 +630,7 @@ io.on("connection", (socket) => {
 
       log(`🆔 ${socket.id} registered as ${role}${accountId ? ` (${accountId})` : ""} with session ${sessionKey}`);
 
-      // [NEW] - Send driver state back if driver exists in memory (handles session not found case)
+      // [NEW] - Mark driver for state restoration after first update (avoids race condition with stale maxCapacity)
       if (role === "driver" && accountId) {
         const existingDriver = drivers[accountId];
         
@@ -621,21 +640,11 @@ io.on("connection", (socket) => {
           existingDriver.disconnected = false;
           existingDriver.disconnectedAt = null;
           
-          // Send driver state back to client
-          socket.emit("driverStateRestored", {
-            accountId: accountId,
-            passengerCount: existingDriver.passengerCount ?? 0,
-            maxCapacity: existingDriver.maxCapacity ?? 0,
-            destinationName: existingDriver.destinationName,
-            destinationLat: existingDriver.destinationLat,
-            destinationLng: existingDriver.destinationLng,
-            organizationName: existingDriver.organizationName,
-            lat: existingDriver.lat,
-            lng: existingDriver.lng,
-            lastUpdated: existingDriver.lastUpdated
-          });
-          
-          log(`🔄 [${accountId}] Driver state restored on registerRole: ${existingDriver.passengerCount ?? 0}/${existingDriver.maxCapacity ?? 0} passengers, destination: ${existingDriver.destinationName || "Unknown"}`);
+          // [FIX] - Don't emit driverStateRestored immediately to avoid race condition with stale maxCapacity
+          // Instead, mark it as pending and emit it after the first passengerCountUpdated or updateLocation event
+          // This ensures we have the correct maxCapacity from the client before restoring state
+          pendingStateRestore.add(accountId);
+          log(`⏳ [${accountId}] Driver registered - state restoration pending first update (to ensure correct maxCapacity)`);
         }
       }
 
@@ -858,6 +867,9 @@ io.on("connection", (socket) => {
       };
       socketToAccountId[socket.id] = accountId;
       accountIdToSocketId[accountId] = socket.id;
+
+      // [FIX] - Emit driverStateRestored if pending (after first update with correct maxCapacity)
+      emitDriverStateRestoredIfPending(socket, accountId);
 
       // Broadcast to all users if conditions are met
       if (shouldBroadcast) {
@@ -1110,6 +1122,9 @@ io.on("connection", (socket) => {
       };
       socketToAccountId[socket.id] = accountId;
       accountIdToSocketId[accountId] = socket.id;
+
+      // [FIX] - Emit driverStateRestored if pending (after first update with correct maxCapacity)
+      emitDriverStateRestoredIfPending(socket, accountId);
 
       // Only broadcast and log if values actually changed
       // This prevents spam when app sends frequent updates with same values
