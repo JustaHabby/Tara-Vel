@@ -376,6 +376,27 @@ io.on("connection", (socket) => {
             DISCONNECT_GRACE_PERIOD / 1000
           }s)`
         );
+
+        // Clean up waiting passengers from all drivers when user disconnects
+        for (const driverAccountId in drivers) {
+          const driver = drivers[driverAccountId];
+          if (driver.waitingPassengers && driver.waitingPassengers[accountId]) {
+            delete driver.waitingPassengers[accountId];
+            // Notify driver that this user is no longer waiting (if driver is online)
+            const driverSocketId = accountIdToSocketId[driverAccountId];
+            if (driverSocketId) {
+              const driverSocket = io.sockets.sockets.get(driverSocketId);
+              if (driverSocket && driverSocket.connected && !driver.disconnected) {
+                driverSocket.emit("pingRemoved", {
+                  from: "server",
+                  userAccountId: accountId,
+                  timestamp: Date.now(),
+                  reason: "user_disconnected"
+                });
+              }
+            }
+          }
+        }
       }
     }
     
@@ -1277,11 +1298,15 @@ io.on("connection", (socket) => {
   socket.on(
     "pingDriver",
     safeHandler("pingDriver", (data) => {
-      const userAccountId = socketToAccountId[socket.id];
-      if (userAccountId && users[userAccountId]) {
-        users[userAccountId].lastActivity = Date.now();
+      // Validate user role before allowing ping
+      if (socket.role !== "user") {
+        const errorMsg = "Only users can ping drivers";
+        socket.emit("error", { message: errorMsg });
+        log(`❌ Socket ${socket.id} (role: ${socket.role || "unregistered"}) attempted to ping driver but is not registered as user`, "error");
+        return;
       }
 
+      const userAccountId = socketToAccountId[socket.id];
       const { driverAccountId, lat, lng, passengerCount, userAccountId: pingUserAccountId } = data || {};
       const effectiveUserAccountId = pingUserAccountId || userAccountId || "unknown";
 
@@ -1300,12 +1325,61 @@ io.on("connection", (socket) => {
         return;
       }
 
-      // Validate passenger count (default to 1 if not provided)
-      const validPassengerCount = passengerCount !== undefined && passengerCount !== null 
-        ? Math.max(1, Math.floor(Number(passengerCount))) 
-        : 1;
+      // Validate and normalize coordinates
+      const userLat = typeof lat === "string" ? parseFloat(lat) : lat;
+      const userLng = typeof lng === "string" ? parseFloat(lng) : lng;
+      
+      if (typeof userLat !== "number" || isNaN(userLat) || userLat < -90 || userLat > 90) {
+        const errorMsg = "Invalid latitude";
+        socket.emit("error", { message: errorMsg });
+        log(`❌ User ${effectiveUserAccountId} failed to ping driver ${driverAccountId}: ${errorMsg}`, "error");
+        return;
+      }
 
-      // Check if driver exists and is online
+      if (typeof userLng !== "number" || isNaN(userLng) || userLng < -180 || userLng > 180) {
+        const errorMsg = "Invalid longitude";
+        socket.emit("error", { message: errorMsg });
+        log(`❌ User ${effectiveUserAccountId} failed to ping driver ${driverAccountId}: ${errorMsg}`, "error");
+        return;
+      }
+
+      // NOTE: This is the number of passengers the USER wants to board, NOT the driver's current passenger count
+      // This value is only sent to the driver for display/tracking purposes on the driver side
+      const MAX_BOARDING_PASSENGERS = 5; // Reasonable maximum for a single boarding request
+      let requestedPassengerCount = 1; // Default: 1 passenger wants to board
+      
+      if (passengerCount !== undefined && passengerCount !== null) {
+        const parsedCount = Number(passengerCount);
+        
+        // Check if it's a valid number
+        if (isNaN(parsedCount) || !isFinite(parsedCount)) {
+          const errorMsg = "Invalid passenger count: must be a number";
+          socket.emit("error", { message: errorMsg });
+          log(`❌ User ${effectiveUserAccountId} failed to ping driver ${driverAccountId}: ${errorMsg}`, "error");
+          return;
+        }
+        
+        // Convert to integer and validate range
+        const intCount = Math.floor(Math.abs(parsedCount));
+        
+        if (intCount < 1) {
+          const errorMsg = "Passenger count must be at least 1";
+          socket.emit("error", { message: errorMsg });
+          log(`❌ User ${effectiveUserAccountId} failed to ping driver ${driverAccountId}: ${errorMsg}`, "error");
+          return;
+        }
+        
+        if (intCount > MAX_BOARDING_PASSENGERS) {
+          const errorMsg = `Passenger count cannot exceed ${MAX_BOARDING_PASSENGERS}`;
+          socket.emit("error", { message: errorMsg });
+          log(`❌ User ${effectiveUserAccountId} failed to ping driver ${driverAccountId}: ${errorMsg}`, "error");
+          return;
+        }
+        
+        requestedPassengerCount = intCount;
+      }
+
+      // Check if driver exists
       const driver = drivers[driverAccountId];
       if (!driver) {
         const errorMsg = "Driver not found";
@@ -1314,15 +1388,8 @@ io.on("connection", (socket) => {
         return;
       }
 
-      if (driver.disconnected || !driver.socketId) {
-        const errorMsg = "Driver is offline";
-        socket.emit("error", { message: errorMsg });
-        log(`❌ User ${effectiveUserAccountId} failed to ping driver ${driverAccountId}: ${errorMsg}`, "error");
-        return;
-      }
-
-      // Get driver's socket ID
-      const driverSocketId = accountIdToSocketId[driverAccountId] || driver.socketId;
+      // Get driver's socket ID (prefer accountIdToSocketId as source of truth)
+      const driverSocketId = accountIdToSocketId[driverAccountId];
       if (!driverSocketId) {
         const errorMsg = "Driver socket not found";
         socket.emit("error", { message: errorMsg });
@@ -1330,18 +1397,63 @@ io.on("connection", (socket) => {
         return;
       }
 
+      // Verify driver socket is actually connected (not just exists in mapping)
+      const driverSocket = io.sockets.sockets.get(driverSocketId);
+      if (!driverSocket || !driverSocket.connected || driver.disconnected) {
+        const errorMsg = "Driver is offline";
+        socket.emit("error", { message: errorMsg });
+        log(`❌ User ${effectiveUserAccountId} failed to ping driver ${driverAccountId}: ${errorMsg}`, "error");
+        return;
+      }
+
+      // Update user location and activity when pinging
+      if (userAccountId && users[userAccountId]) {
+        users[userAccountId].lat = userLat;
+        users[userAccountId].lng = userLng;
+        users[userAccountId].lastActivity = Date.now();
+      } else if (userAccountId) {
+        // Create user entry if it doesn't exist but accountId is available
+        users[userAccountId] = {
+          accountId: userAccountId,
+          socketId: socket.id,
+          lat: userLat,
+          lng: userLng,
+          lastActivity: Date.now(),
+          connectedAt: Date.now(),
+          disconnected: false,
+          disconnectedAt: null
+        };
+        socketToAccountId[socket.id] = userAccountId;
+        accountIdToSocketId[userAccountId] = socket.id;
+      }
+
+      // Track waiting passengers in driver object (for driver-side display only)
+      // NOTE: This passengerCount is the number the user wants to board, NOT the driver's current count
+      if (!driver.waitingPassengers) {
+        driver.waitingPassengers = {};
+      }
+      driver.waitingPassengers[effectiveUserAccountId] = {
+        userAccountId: effectiveUserAccountId,
+        lat: userLat,
+        lng: userLng,
+        passengerCount: requestedPassengerCount, // Number of passengers user wants to board
+        pingedAt: Date.now()
+      };
+      drivers[driverAccountId] = driver;
+
       // Send ping ONLY to the specific driver (not broadcasted)
+      // The passengerCount here is for driver-side display only - driver updates their own count separately
       try {
-        io.to(driverSocketId).emit("pingReceived", {
+        driverSocket.emit("pingReceived", {
           from: "user",
           userAccountId: effectiveUserAccountId,
-          lat: lat,
-          lng: lng,
-          passengerCount: validPassengerCount,
+          lat: userLat,
+          lng: userLng,
+          passengerCount: requestedPassengerCount, // Number of passengers user wants to board (for driver display only)
           timestamp: Date.now(),
         });
 
-        log(`✅ User ${effectiveUserAccountId} pinged driver ${driverAccountId}`);
+        log(`✅ User ${effectiveUserAccountId} pinged driver ${driverAccountId} at (${userLat.toFixed(6)}, ${userLng.toFixed(6)}) - requesting to board ${requestedPassengerCount} passenger(s)`);
       } catch (error) {
         const errorMsg = `Failed to send ping: ${error.message}`;
         socket.emit("error", { message: errorMsg });
@@ -1361,6 +1473,14 @@ io.on("connection", (socket) => {
   socket.on(
     "unpingDriver",
     safeHandler("unpingDriver", (data) => {
+      // Validate user role before allowing unping
+      if (socket.role !== "user") {
+        const errorMsg = "Only users can unping drivers";
+        socket.emit("error", { message: errorMsg });
+        log(`❌ Socket ${socket.id} (role: ${socket.role || "unregistered"}) attempted to unping driver but is not registered as user`, "error");
+        return;
+      }
+
       const userAccountId = socketToAccountId[socket.id];
       if (userAccountId && users[userAccountId]) {
         users[userAccountId].lastActivity = Date.now();
@@ -1377,7 +1497,7 @@ io.on("connection", (socket) => {
         return;
       }
 
-      // Check if driver exists and is online
+      // Check if driver exists
       const driver = drivers[driverAccountId];
       if (!driver) {
         const errorMsg = "Driver not found";
@@ -1386,15 +1506,8 @@ io.on("connection", (socket) => {
         return;
       }
 
-      if (driver.disconnected || !driver.socketId) {
-        const errorMsg = "Driver is offline";
-        socket.emit("error", { message: errorMsg });
-        log(`❌ User ${effectiveUserAccountId} failed to unping driver ${driverAccountId}: ${errorMsg}`, "error");
-        return;
-      }
-
-      // Get driver's socket ID
-      const driverSocketId = accountIdToSocketId[driverAccountId] || driver.socketId;
+      // Get driver's socket ID (prefer accountIdToSocketId as source of truth)
+      const driverSocketId = accountIdToSocketId[driverAccountId];
       if (!driverSocketId) {
         const errorMsg = "Driver socket not found";
         socket.emit("error", { message: errorMsg });
@@ -1402,9 +1515,24 @@ io.on("connection", (socket) => {
         return;
       }
 
+      // Verify driver socket is actually connected (not just exists in mapping)
+      const driverSocket = io.sockets.sockets.get(driverSocketId);
+      if (!driverSocket || !driverSocket.connected || driver.disconnected) {
+        const errorMsg = "Driver is offline";
+        socket.emit("error", { message: errorMsg });
+        log(`❌ User ${effectiveUserAccountId} failed to unping driver ${driverAccountId}: ${errorMsg}`, "error");
+        return;
+      }
+
+      // Remove waiting passenger from driver's tracking
+      if (driver.waitingPassengers && driver.waitingPassengers[effectiveUserAccountId]) {
+        delete driver.waitingPassengers[effectiveUserAccountId];
+        drivers[driverAccountId] = driver;
+      }
+
       // Send unping ONLY to the specific driver (not broadcasted)
       try {
-        io.to(driverSocketId).emit("pingRemoved", {
+        driverSocket.emit("pingRemoved", {
           from: "user",
           userAccountId: effectiveUserAccountId,
           timestamp: Date.now(),
