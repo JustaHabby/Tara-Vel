@@ -1310,9 +1310,14 @@ io.on("connection", (socket) => {
       const { driverAccountId, lat, lng, passengerCount, userAccountId: pingUserAccountId } = data || {};
       const effectiveUserAccountId = pingUserAccountId || userAccountId || "unknown";
 
+      // Debug log to help diagnose ping issues
+      log(`🔍 [DEBUG] pingDriver received from ${socket.id}: ${JSON.stringify({ driverAccountId, lat, lng, passengerCount, userAccountId: pingUserAccountId })}`);
+
       // Validate required fields
-      if (!driverAccountId) {
-        const errorMsg = "Missing driverAccountId";
+      if (!driverAccountId || (typeof driverAccountId === "string" && driverAccountId.trim() === "")) {
+        const errorMsg = driverAccountId === undefined || driverAccountId === null 
+          ? "Missing driverAccountId" 
+          : "driverAccountId cannot be empty";
         socket.emit("error", { message: errorMsg });
         log(`❌ User ${effectiveUserAccountId} failed to ping driver: ${errorMsg}`, "error");
         return;
