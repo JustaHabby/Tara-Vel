@@ -1354,7 +1354,7 @@ io.on("connection", (socket) => {
 
       // NOTE: This is the number of passengers the USER wants to board, NOT the driver's current passenger count
       // This value is only sent to the driver for display/tracking purposes on the driver side
-      const MAX_BOARDING_PASSENGERS = 5; // Reasonable maximum for a single boarding request
+      const MAX_BOARDING_PASSENGERS = 20; // Reasonable maximum for a single boarding request
       let requestedPassengerCount = 1; // Default: 1 passenger wants to board
       
       if (passengerCount !== undefined && passengerCount !== null) {
