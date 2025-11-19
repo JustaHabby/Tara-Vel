@@ -1609,7 +1609,16 @@ io.on("connection", (socket) => {
       // Remove from pending state restoration if present
       pendingStateRestore.delete(accountId);
 
-      log(`🗑️ [${accountId}] Driver session ended immediately (user-initiated)`);
+      // Verify driver was removed and log confirmation
+      const driverRemoved = !drivers[accountId];
+      if (driverRemoved) {
+        log(`🗑️ [${accountId}] Driver session ended immediately (user-initiated)`);
+        if (IS_DEV) {
+          console.log(`🧹 Cleaned up driver ${accountId} (manual endSession)`);
+        }
+      } else {
+        log(`⚠️ [${accountId}] Warning: Driver may not have been fully removed from drivers{}`, "error");
+      }
       
       // Notify all users that this driver is no longer available
       io.to("user").emit("driverRemoved", {
