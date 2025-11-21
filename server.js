@@ -984,6 +984,7 @@ io.on("connection", (socket) => {
           accountId,
           lat,
           lng,
+          geometry: drivers[accountId].geometry, // Include route geometry to keep marker and polyline in sync
           destinationName: drivers[accountId].destinationName,
           destinationLat: drivers[accountId].destinationLat,
           destinationLng: drivers[accountId].destinationLng,
@@ -1451,7 +1452,7 @@ io.on("connection", (socket) => {
 
       // NOTE: This is the number of passengers the USER wants to board, NOT the driver's current passenger count
       // This value is only sent to the driver for display/tracking purposes on the driver side
-      const MAX_BOARDING_PASSENGERS = 5; // Reasonable maximum for a single boarding request
+      const MAX_BOARDING_PASSENGERS = 10; // Reasonable maximum for a single boarding request
       let requestedPassengerCount = 1; // Default: 1 passenger wants to board
       
       if (passengerCount !== undefined && passengerCount !== null) {
@@ -1582,6 +1583,7 @@ io.on("connection", (socket) => {
             accountId: driverAccountId,
             lat: driver.lat,
             lng: driver.lng,
+            geometry: driver.geometry, // Include route geometry to keep marker and polyline in sync
             destinationName: driver.destinationName || "Unknown",
             destinationLat: driver.destinationLat,
             destinationLng: driver.destinationLng,
@@ -1703,6 +1705,7 @@ io.on("connection", (socket) => {
             accountId: driverAccountId,
             lat: driver.lat,
             lng: driver.lng,
+            geometry: driver.geometry, // Include route geometry to keep marker and polyline in sync
             destinationName: driver.destinationName || "Unknown",
             destinationLat: driver.destinationLat,
             destinationLng: driver.destinationLng,
