@@ -971,7 +971,7 @@ io.on("connection", (socket) => {
         const currentDriver = drivers[accountId];
         const waitingPassengersList = currentDriver.waitingPassengers ? 
           Object.values(currentDriver.waitingPassengers).map(passenger => ({
-            userId: passenger.userAccountId,
+            userId: passenger.userAccountId || passenger.userId,
             lat: passenger.lat,
             lng: passenger.lng,
             passengerCount: passenger.passengerCount || 1
@@ -1318,4 +1318,4 @@ io.on("connection", (socket) => {
   socket.on(
     "requestCurrentData",
     safeHandler("requestCurrentData", () => {
-      const userAccountId = socketToAccountI... (24 KB left)
+      const userAccountI... (24 KB left)
