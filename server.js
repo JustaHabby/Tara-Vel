@@ -551,20 +551,34 @@ io.on("connection", (socket) => {
           .filter(
             (driver) => driver.accountId && (driver.lat || driver.geometry)
           )
-          .map((driver) => ({
-            accountId: driver.accountId,
-            lat: driver.lat,
-            lng: driver.lng,
-            geometry: driver.geometry,
-            destinationName: driver.destinationName,
-            destinationLat: driver.destinationLat,
-            destinationLng: driver.destinationLng,
-            passengerCount: driver.passengerCount ?? 0,
-            maxCapacity: driver.maxCapacity ?? 0,
-            organizationName: driver.organizationName,
-            lastUpdated: driver.lastUpdated,
-            isOnline: !driver.disconnected,
-          }));
+          .map((driver) => {
+            // Calculate waiting passengers data
+            const waitingPassengersList = driver.waitingPassengers ? 
+              Object.values(driver.waitingPassengers).map(passenger => ({
+                userId: passenger.userAccountId || passenger.userId,
+                lat: passenger.lat,
+                lng: passenger.lng,
+                passengerCount: passenger.passengerCount || 1
+              })) : [];
+            const totalWaitingPassengers = waitingPassengersList.reduce((sum, p) => sum + (p.passengerCount || 1), 0);
+            
+            return {
+              accountId: driver.accountId,
+              lat: driver.lat,
+              lng: driver.lng,
+              geometry: driver.geometry,
+              destinationName: driver.destinationName,
+              destinationLat: driver.destinationLat,
+              destinationLng: driver.destinationLng,
+              passengerCount: driver.passengerCount ?? 0,
+              maxCapacity: driver.maxCapacity ?? 0,
+              organizationName: driver.organizationName,
+              lastUpdated: driver.lastUpdated,
+              isOnline: !driver.disconnected,
+              waitingUsersCount: totalWaitingPassengers,
+              waitingUsers: waitingPassengersList
+            };
+          });
 
         const totalDrivers = driversArray.length;
         if (MAX_SNAPSHOT_DRIVERS > 0 && totalDrivers > MAX_SNAPSHOT_DRIVERS) {
@@ -713,20 +727,34 @@ io.on("connection", (socket) => {
           .filter(
             (driver) => driver.accountId && (driver.lat || driver.geometry)
           )
-          .map((driver) => ({
-            accountId: driver.accountId,
-            lat: driver.lat,
-            lng: driver.lng,
-            geometry: driver.geometry,
-            destinationName: driver.destinationName,
-            destinationLat: driver.destinationLat,
-            destinationLng: driver.destinationLng,
-            passengerCount: driver.passengerCount ?? 0,
-            maxCapacity: driver.maxCapacity ?? 0,
-            organizationName: driver.organizationName,
-            lastUpdated: driver.lastUpdated, // server-only for sorting
-            isOnline: !driver.disconnected, // Include connection status
-          }));
+          .map((driver) => {
+            // Calculate waiting passengers data
+            const waitingPassengersList = driver.waitingPassengers ? 
+              Object.values(driver.waitingPassengers).map(passenger => ({
+                userId: passenger.userAccountId || passenger.userId,
+                lat: passenger.lat,
+                lng: passenger.lng,
+                passengerCount: passenger.passengerCount || 1
+              })) : [];
+            const totalWaitingPassengers = waitingPassengersList.reduce((sum, p) => sum + (p.passengerCount || 1), 0);
+            
+            return {
+              accountId: driver.accountId,
+              lat: driver.lat,
+              lng: driver.lng,
+              geometry: driver.geometry,
+              destinationName: driver.destinationName,
+              destinationLat: driver.destinationLat,
+              destinationLng: driver.destinationLng,
+              passengerCount: driver.passengerCount ?? 0,
+              maxCapacity: driver.maxCapacity ?? 0,
+              organizationName: driver.organizationName,
+              lastUpdated: driver.lastUpdated, // server-only for sorting
+              isOnline: !driver.disconnected, // Include connection status
+              waitingUsersCount: totalWaitingPassengers,
+              waitingUsers: waitingPassengersList
+            };
+          });
 
         const totalDrivers = driversArray.length;
         if (MAX_SNAPSHOT_DRIVERS > 0 && totalDrivers > MAX_SNAPSHOT_DRIVERS) {
@@ -759,19 +787,33 @@ io.on("connection", (socket) => {
             .filter(
               (driver) => driver.accountId && (driver.lat || driver.geometry)
             )
-            .map((driver) => ({
-              accountId: driver.accountId,
-              lat: driver.lat,
-              lng: driver.lng,
-              geometry: driver.geometry,
-              destinationName: driver.destinationName,
-              destinationLat: driver.destinationLat,
-              destinationLng: driver.destinationLng,
-              passengerCount: driver.passengerCount ?? 0,
-              maxCapacity: driver.maxCapacity ?? 0,
-              organizationName: driver.organizationName,
-              isOnline: !driver.disconnected, // Include connection status
-            }));
+            .map((driver) => {
+              // Calculate waiting passengers data
+              const waitingPassengersList = driver.waitingPassengers ? 
+                Object.values(driver.waitingPassengers).map(passenger => ({
+                  userId: passenger.userAccountId || passenger.userId,
+                  lat: passenger.lat,
+                  lng: passenger.lng,
+                  passengerCount: passenger.passengerCount || 1
+                })) : [];
+              const totalWaitingPassengers = waitingPassengersList.reduce((sum, p) => sum + (p.passengerCount || 1), 0);
+              
+              return {
+                accountId: driver.accountId,
+                lat: driver.lat,
+                lng: driver.lng,
+                geometry: driver.geometry,
+                destinationName: driver.destinationName,
+                destinationLat: driver.destinationLat,
+                destinationLng: driver.destinationLng,
+                passengerCount: driver.passengerCount ?? 0,
+                maxCapacity: driver.maxCapacity ?? 0,
+                organizationName: driver.organizationName,
+                isOnline: !driver.disconnected, // Include connection status
+                waitingUsersCount: totalWaitingPassengers,
+                waitingUsers: waitingPassengersList
+              };
+            });
 
           socket.emit("currentData", {
             buses: lateJoinSnapshot,
@@ -1276,56 +1318,4 @@ io.on("connection", (socket) => {
   socket.on(
     "requestCurrentData",
     safeHandler("requestCurrentData", () => {
-      const userAccountId = socketToAccountId[socket.id];
-      if (userAccountId && users[userAccountId]) {
-        users[userAccountId].lastActivity = Date.now();
-      }
-
-      // Re-use the optimized snapshot generation logic from registerRole
-      let driversArray = Object.values(drivers)
-        // Filter for drivers with location OR geometry data
-        .filter((driver) => driver.accountId && (driver.lat || driver.geometry))
-        .map((driver) => ({
-          accountId: driver.accountId,
-          lat: driver.lat,
-          lng: driver.lng,
-          geometry: driver.geometry, // CRITICAL: Includes the polyline
-          destinationName: driver.destinationName,
-          destinationLat: driver.destinationLat,
-          destinationLng: driver.destinationLng,
-          passengerCount: driver.passengerCount ?? 0,
-          maxCapacity: driver.maxCapacity ?? 0,
-          organizationName: driver.organizationName,
-          lastUpdated: driver.lastUpdated, // Used for sorting
-          isOnline: !driver.disconnected, // Include connection status
-        }));
-
-      // Limit snapshot size if configured (optimization for many drivers)
-      const totalDrivers = driversArray.length;
-      if ( MAX_SNAPSHOT_DRIVERS > 0 && driversArray.length > MAX_SNAPSHOT_DRIVERS) {
-        driversArray = driversArray
-          .sort(
-            (a, b) =>
-              new Date(b.lastUpdated || 0) - new Date(a.lastUpdated || 0)
-          )
-          .slice(0, MAX_SNAPSHOT_DRIVERS)
-          .map(({ lastUpdated, ...driver }) => driver); // Remove lastUpdated
-        log(
-          `⚠️ Snapshot refresh limited to ${MAX_SNAPSHOT_DRIVERS} of ${totalDrivers} drivers`
-        );
-      } else {
-        // Remove lastUpdated before sending to client (server-only field)
-        driversArray = driversArray.map(({ lastUpdated, ...driver }) => driver);
-      }
-
-      socket.emit("driversSnapshot", {
-        drivers: driversArray,
-        count: driversArray.length,
-        total: totalDrivers,
-        limited:
-          MAX_SNAPSHOT_DRIVERS > 0 && totalDrivers > MAX_SNAPSHOT_DRIVERS,
-      });
-
-      log(
-        `📤 Sent requested snapshot of ${driversArray.length} driver(s) to user ${socket.id}`
-  ... (21 KB left)
+      const userAccountId = socketToAccountI... (24 KB left)
