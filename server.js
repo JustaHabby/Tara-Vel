@@ -2,7 +2,7 @@
  * ===============================
  * 🚌 Real-Time Bus Tracking Server (Relay + On-Demand Info)
  * ===============================
- * @version 9.1.1
+ * @version 10.0.1
  * @author TaraVel Team
  */
 
@@ -50,8 +50,37 @@ const accountIdToSocketId = {};
 const sessionKeyToSocketId = {}; // Maps sessionKey -> socketId
 const socketIdToSessionKey = {}; // Maps socketId -> sessionKey
 const sessions = {}; // Maps sessionKey -> { accountId, role, createdAt, lastActivity }
+// Track drivers that need state restoration after registration (to avoid race condition with stale maxCapacity)
+const pendingStateRestore = new Set(); // Set of accountIds that need state restoration
 
 // ========== HELPER FUNCTIONS ==========
+
+/**
+ * Emit driverStateRestored event if driver is pending restoration
+ * This ensures we have the correct maxCapacity from the client before restoring state
+ */
+function emitDriverStateRestoredIfPending(socket, accountId) {
+  if (pendingStateRestore.has(accountId)) {
+    const driver = drivers[accountId];
+    if (driver) {
+      socket.emit("driverStateRestored", {
+        accountId: accountId,
+        passengerCount: driver.passengerCount ?? 0,
+        maxCapacity: driver.maxCapacity ?? 0,
+        destinationName: driver.destinationName,
+        destinationLat: driver.destinationLat,
+        destinationLng: driver.destinationLng,
+        organizationName: driver.organizationName,
+        lat: driver.lat,
+        lng: driver.lng,
+        lastUpdated: driver.lastUpdated
+      });
+      
+      log(`🔄 [${accountId}] Driver state restored after update: ${driver.passengerCount ?? 0}/${driver.maxCapacity ?? 0} passengers, destination: ${driver.destinationName || "Unknown"}`);
+      pendingStateRestore.delete(accountId);
+    }
+  }
+}
 
 /**
  * Calculate the distance between two coordinates using a simplified Euclidean distance formula.
@@ -92,6 +121,10 @@ function checkRateLimit(
 /**
  * Clean up stale drivers from memory.
  * Drivers that haven't sent an update in STALE_DRIVER_TIMEOUT milliseconds are considered inactive and are removed from the drivers store.
+ * 
+ * NOTE: This automatic cleanup runs every CLEANUP_INTERVAL (60s) for redundancy.
+ * Even if a driver was manually removed via "endSession", this function still runs
+ * and will safely skip drivers that no longer exist (no errors thrown).
  */
 function cleanupStaleDrivers() {
   const now = Date.now();
@@ -326,14 +359,41 @@ io.on("connection", (socket) => {
     
     if (accountId && drivers[accountId]) {
       if (drivers[accountId].socketId === socket.id) {
-        drivers[accountId].disconnected = true;
-        drivers[accountId].disconnectedAt = Date.now();
-        drivers[accountId].socketId = null;
+        const driver = drivers[accountId];
+        driver.disconnected = true;
+        driver.disconnectedAt = Date.now();
+        driver.socketId = null;
         log(
           `🔌 [${accountId}] Driver disconnected (grace period: ${
             DISCONNECT_GRACE_PERIOD / 1000
           }s)`
         );
+
+        // Get list of waiting passengers before marking as disconnected
+        const waitingPassengerIds = driver.waitingPassengers ? Object.keys(driver.waitingPassengers) : [];
+        
+        io.to("user").emit("driverDisconnected", {
+          accountId: accountId,
+          timestamp: Date.now()
+        });
+
+        if (waitingPassengerIds.length > 0) {
+          waitingPassengerIds.forEach((userId) => {
+            const userSocketId = accountIdToSocketId[userId];
+            if (userSocketId) {
+              const userSocket = io.sockets.sockets.get(userSocketId);
+              if (userSocket && userSocket.connected && users[userId] && !users[userId].disconnected) {
+                userSocket.emit("error", {
+                  message: "The driver you pinged has disconnected. Please select another driver.",
+                  driverAccountId: accountId
+                });
+                log(`⚠️ Notified waiting user ${userId} that driver ${accountId} disconnected`);
+              }
+            }
+          });
+        }
+
+        log(`📢 Emitted driverDisconnected for ${accountId} (${waitingPassengerIds.length} waiting users notified)`);
       }
     }
     
@@ -347,6 +407,27 @@ io.on("connection", (socket) => {
             DISCONNECT_GRACE_PERIOD / 1000
           }s)`
         );
+
+        // Clean up waiting passengers from all drivers when user disconnects
+        for (const driverAccountId in drivers) {
+          const driver = drivers[driverAccountId];
+          if (driver.waitingPassengers && driver.waitingPassengers[accountId]) {
+            delete driver.waitingPassengers[accountId];
+            // Notify driver that this user is no longer waiting (if driver is online)
+            const driverSocketId = accountIdToSocketId[driverAccountId];
+            if (driverSocketId) {
+              const driverSocket = io.sockets.sockets.get(driverSocketId);
+              if (driverSocket && driverSocket.connected && !driver.disconnected) {
+                driverSocket.emit("pingRemoved", {
+                  from: "server",
+                  userAccountId: accountId,
+                  timestamp: Date.now(),
+                  reason: "user_disconnected"
+                });
+              }
+            }
+          }
+        }
       }
     }
     
@@ -435,6 +516,27 @@ io.on("connection", (socket) => {
 
       log(`🔄 [${socket.id}] Session resumed: ${sessionKey} (${existingSession.role}${existingSession.accountId ? `, ${existingSession.accountId}` : ""})`);
 
+      // [NEW] - Mark driver for state restoration after first update (avoids race condition with stale maxCapacity)
+      if (existingSession.role === "driver" && existingSession.accountId) {
+        const driverAccountId = existingSession.accountId;
+        const existingDriver = drivers[driverAccountId];
+        
+        if (existingDriver) {
+          // Restore driver's socket ID and connection status
+          existingDriver.socketId = socket.id;
+          existingDriver.disconnected = false;
+          existingDriver.disconnectedAt = null;
+          
+          // [FIX] - Don't emit driverStateRestored immediately to avoid race condition with stale maxCapacity
+          // Instead, mark it as pending and emit it after the first passengerCountUpdated or updateLocation event
+          // This ensures we have the correct maxCapacity from the client before restoring state
+          pendingStateRestore.add(driverAccountId);
+          log(`⏳ [${driverAccountId}] Driver session resumed - state restoration pending first update (to ensure correct maxCapacity)`);
+        } else {
+          log(`⚠️ [${driverAccountId}] Driver not found in memory during session resume`);
+        }
+      }
+
       // Send drivers snapshot if user
       if (existingSession.role === "user") {
         const userAccountId = existingSession.accountId;
@@ -449,20 +551,34 @@ io.on("connection", (socket) => {
           .filter(
             (driver) => driver.accountId && (driver.lat || driver.geometry)
           )
-          .map((driver) => ({
-            accountId: driver.accountId,
-            lat: driver.lat,
-            lng: driver.lng,
-            geometry: driver.geometry,
-            destinationName: driver.destinationName,
-            destinationLat: driver.destinationLat,
-            destinationLng: driver.destinationLng,
-            passengerCount: driver.passengerCount ?? 0,
-            maxCapacity: driver.maxCapacity ?? 0,
-            organizationName: driver.organizationName,
-            lastUpdated: driver.lastUpdated,
-            isOnline: !driver.disconnected,
-          }));
+          .map((driver) => {
+            // Calculate waiting passengers data
+            const waitingPassengersList = driver.waitingPassengers ? 
+              Object.values(driver.waitingPassengers).map(passenger => ({
+                userId: passenger.userAccountId || passenger.userId,
+                lat: passenger.lat,
+                lng: passenger.lng,
+                passengerCount: passenger.passengerCount || 1
+              })) : [];
+            const totalWaitingPassengers = waitingPassengersList.reduce((sum, p) => sum + (p.passengerCount || 1), 0);
+            
+            return {
+              accountId: driver.accountId,
+              lat: driver.lat,
+              lng: driver.lng,
+              geometry: driver.geometry,
+              destinationName: driver.destinationName,
+              destinationLat: driver.destinationLat,
+              destinationLng: driver.destinationLng,
+              passengerCount: driver.passengerCount ?? 0,
+              maxCapacity: driver.maxCapacity ?? 0,
+              organizationName: driver.organizationName,
+              lastUpdated: driver.lastUpdated,
+              isOnline: !driver.disconnected,
+              waitingUsersCount: totalWaitingPassengers,
+              waitingUsers: waitingPassengersList
+            };
+          });
 
         const totalDrivers = driversArray.length;
         if (MAX_SNAPSHOT_DRIVERS > 0 && totalDrivers > MAX_SNAPSHOT_DRIVERS) {
@@ -580,6 +696,24 @@ io.on("connection", (socket) => {
 
       log(`🆔 ${socket.id} registered as ${role}${accountId ? ` (${accountId})` : ""} with session ${sessionKey}`);
 
+      // [NEW] - Mark driver for state restoration after first update (avoids race condition with stale maxCapacity)
+      if (role === "driver" && accountId) {
+        const existingDriver = drivers[accountId];
+        
+        if (existingDriver) {
+          // Update driver's socket ID and connection status
+          existingDriver.socketId = socket.id;
+          existingDriver.disconnected = false;
+          existingDriver.disconnectedAt = null;
+          
+          // [FIX] - Don't emit driverStateRestored immediately to avoid race condition with stale maxCapacity
+          // Instead, mark it as pending and emit it after the first passengerCountUpdated or updateLocation event
+          // This ensures we have the correct maxCapacity from the client before restoring state
+          pendingStateRestore.add(accountId);
+          log(`⏳ [${accountId}] Driver registered - state restoration pending first update (to ensure correct maxCapacity)`);
+        }
+      }
+
       if (role === "user") {
         users[accountId] = {
           accountId,
@@ -593,20 +727,34 @@ io.on("connection", (socket) => {
           .filter(
             (driver) => driver.accountId && (driver.lat || driver.geometry)
           )
-          .map((driver) => ({
-            accountId: driver.accountId,
-            lat: driver.lat,
-            lng: driver.lng,
-            geometry: driver.geometry,
-            destinationName: driver.destinationName,
-            destinationLat: driver.destinationLat,
-            destinationLng: driver.destinationLng,
-            passengerCount: driver.passengerCount ?? 0,
-            maxCapacity: driver.maxCapacity ?? 0,
-            organizationName: driver.organizationName,
-            lastUpdated: driver.lastUpdated, // server-only for sorting
-            isOnline: !driver.disconnected, // Include connection status
-          }));
+          .map((driver) => {
+            // Calculate waiting passengers data
+            const waitingPassengersList = driver.waitingPassengers ? 
+              Object.values(driver.waitingPassengers).map(passenger => ({
+                userId: passenger.userAccountId || passenger.userId,
+                lat: passenger.lat,
+                lng: passenger.lng,
+                passengerCount: passenger.passengerCount || 1
+              })) : [];
+            const totalWaitingPassengers = waitingPassengersList.reduce((sum, p) => sum + (p.passengerCount || 1), 0);
+            
+            return {
+              accountId: driver.accountId,
+              lat: driver.lat,
+              lng: driver.lng,
+              geometry: driver.geometry,
+              destinationName: driver.destinationName,
+              destinationLat: driver.destinationLat,
+              destinationLng: driver.destinationLng,
+              passengerCount: driver.passengerCount ?? 0,
+              maxCapacity: driver.maxCapacity ?? 0,
+              organizationName: driver.organizationName,
+              lastUpdated: driver.lastUpdated, // server-only for sorting
+              isOnline: !driver.disconnected, // Include connection status
+              waitingUsersCount: totalWaitingPassengers,
+              waitingUsers: waitingPassengersList
+            };
+          });
 
         const totalDrivers = driversArray.length;
         if (MAX_SNAPSHOT_DRIVERS > 0 && totalDrivers > MAX_SNAPSHOT_DRIVERS) {
@@ -639,19 +787,33 @@ io.on("connection", (socket) => {
             .filter(
               (driver) => driver.accountId && (driver.lat || driver.geometry)
             )
-            .map((driver) => ({
-              accountId: driver.accountId,
-              lat: driver.lat,
-              lng: driver.lng,
-              geometry: driver.geometry,
-              destinationName: driver.destinationName,
-              destinationLat: driver.destinationLat,
-              destinationLng: driver.destinationLng,
-              passengerCount: driver.passengerCount ?? 0,
-              maxCapacity: driver.maxCapacity ?? 0,
-              organizationName: driver.organizationName,
-              isOnline: !driver.disconnected, // Include connection status
-            }));
+            .map((driver) => {
+              // Calculate waiting passengers data
+              const waitingPassengersList = driver.waitingPassengers ? 
+                Object.values(driver.waitingPassengers).map(passenger => ({
+                  userId: passenger.userAccountId || passenger.userId,
+                  lat: passenger.lat,
+                  lng: passenger.lng,
+                  passengerCount: passenger.passengerCount || 1
+                })) : [];
+              const totalWaitingPassengers = waitingPassengersList.reduce((sum, p) => sum + (p.passengerCount || 1), 0);
+              
+              return {
+                accountId: driver.accountId,
+                lat: driver.lat,
+                lng: driver.lng,
+                geometry: driver.geometry,
+                destinationName: driver.destinationName,
+                destinationLat: driver.destinationLat,
+                destinationLng: driver.destinationLng,
+                passengerCount: driver.passengerCount ?? 0,
+                maxCapacity: driver.maxCapacity ?? 0,
+                organizationName: driver.organizationName,
+                isOnline: !driver.disconnected, // Include connection status
+                waitingUsersCount: totalWaitingPassengers,
+                waitingUsers: waitingPassengersList
+              };
+            });
 
           socket.emit("currentData", {
             buses: lateJoinSnapshot,
@@ -766,7 +928,8 @@ io.on("connection", (socket) => {
       // Check if coordinates changed (for logging movement)
       const timeSinceLastBroadcast = prevDriver?.lastBroadcastTime ? now - prevDriver.lastBroadcastTime : Infinity;
 
-      const locationChanged = !prevDriver || !prevDriver.lastLat || prevDriver.lastLng || calculateDistance(lat, lng, prevDriver.lastLat, prevDriver.lastLng) > LOCATION_CHANGE_THRESHOLD;
+      // Fix: Added missing ! before prevDriver.lastLng to properly check if lastLng is missing
+      const locationChanged = !prevDriver || !prevDriver.lastLat || !prevDriver.lastLng || calculateDistance(lat, lng, prevDriver.lastLat, prevDriver.lastLng) > LOCATION_CHANGE_THRESHOLD;
       const passengerDataChanged = passengerCount !== prevDriver?.passengerCount || maxCapacity !== prevDriver?.maxCapacity;
       const isIntervalUpdate = timeSinceLastBroadcast >= LOCATION_UPDATE_INTERVAL;
       const shouldBroadcast = !prevDriver || locationChanged || passengerDataChanged || isIntervalUpdate;
@@ -799,18 +962,36 @@ io.on("connection", (socket) => {
       socketToAccountId[socket.id] = accountId;
       accountIdToSocketId[accountId] = socket.id;
 
+      // [FIX] - Emit driverStateRestored if pending (after first update with correct maxCapacity)
+      emitDriverStateRestoredIfPending(socket, accountId);
+
       // Broadcast to all users if conditions are met
       if (shouldBroadcast) {
+        // Include waiting passengers list in broadcast
+        const currentDriver = drivers[accountId];
+        const waitingPassengersList = currentDriver.waitingPassengers ? 
+          Object.values(currentDriver.waitingPassengers).map(passenger => ({
+            userId: passenger.userAccountId || passenger.userId,
+            lat: passenger.lat,
+            lng: passenger.lng,
+            passengerCount: passenger.passengerCount || 1
+          })) : [];
+        
+        const totalWaitingPassengers = waitingPassengersList.reduce((sum, p) => sum + (p.passengerCount || 1), 0);
+
         const broadcastData = {
           from: "driver",
           accountId,
           lat,
           lng,
+          geometry: drivers[accountId].geometry, // Include route geometry to keep marker and polyline in sync
           destinationName: drivers[accountId].destinationName,
           destinationLat: drivers[accountId].destinationLat,
           destinationLng: drivers[accountId].destinationLng,
           passengerCount: drivers[accountId].passengerCount,
           maxCapacity: drivers[accountId].maxCapacity,
+          waitingUsersCount: totalWaitingPassengers, // Include waiting count
+          waitingUsers: waitingPassengersList, // Include waiting users locations
           lastUpdated: drivers[accountId].lastUpdated, // Include timestamp for freshness tracking
           isOnline: true, // Driver is online (receiving updates)
         };
@@ -1051,6 +1232,9 @@ io.on("connection", (socket) => {
       socketToAccountId[socket.id] = accountId;
       accountIdToSocketId[accountId] = socket.id;
 
+      // [FIX] - Emit driverStateRestored if pending (after first update with correct maxCapacity)
+      emitDriverStateRestoredIfPending(socket, accountId);
+
       // Only broadcast and log if values actually changed
       // This prevents spam when app sends frequent updates with same values
       if (valuesChanged) {
@@ -1144,24 +1328,38 @@ io.on("connection", (socket) => {
       let driversArray = Object.values(drivers)
         // Filter for drivers with location OR geometry data
         .filter((driver) => driver.accountId && (driver.lat || driver.geometry))
-        .map((driver) => ({
-          accountId: driver.accountId,
-          lat: driver.lat,
-          lng: driver.lng,
-          geometry: driver.geometry, // CRITICAL: Includes the polyline
-          destinationName: driver.destinationName,
-          destinationLat: driver.destinationLat,
-          destinationLng: driver.destinationLng,
-          passengerCount: driver.passengerCount ?? 0,
-          maxCapacity: driver.maxCapacity ?? 0,
-          organizationName: driver.organizationName,
-          lastUpdated: driver.lastUpdated, // Used for sorting
-          isOnline: !driver.disconnected, // Include connection status
-        }));
+        .map((driver) => {
+          // Calculate waiting passengers data
+          const waitingPassengersList = driver.waitingPassengers ? 
+            Object.values(driver.waitingPassengers).map(passenger => ({
+              userId: passenger.userAccountId || passenger.userId,
+              lat: passenger.lat,
+              lng: passenger.lng,
+              passengerCount: passenger.passengerCount || 1
+            })) : [];
+          const totalWaitingPassengers = waitingPassengersList.reduce((sum, p) => sum + (p.passengerCount || 1), 0);
+          
+          return {
+            accountId: driver.accountId,
+            lat: driver.lat,
+            lng: driver.lng,
+            geometry: driver.geometry, // CRITICAL: Includes the polyline
+            destinationName: driver.destinationName,
+            destinationLat: driver.destinationLat,
+            destinationLng: driver.destinationLng,
+            passengerCount: driver.passengerCount ?? 0,
+            maxCapacity: driver.maxCapacity ?? 0,
+            organizationName: driver.organizationName,
+            lastUpdated: driver.lastUpdated, // Used for sorting
+            isOnline: !driver.disconnected, // Include connection status
+            waitingUsersCount: totalWaitingPassengers,
+            waitingUsers: waitingPassengersList
+          };
+        });
 
       // Limit snapshot size if configured (optimization for many drivers)
       const totalDrivers = driversArray.length;
-      if ( MAX_SNAPSHOT_DRIVERS > 0 && driversArray.length > MAX_SNAPSHOT_DRIVERS) {
+      if (MAX_SNAPSHOT_DRIVERS > 0 && driversArray.length > MAX_SNAPSHOT_DRIVERS) {
         driversArray = driversArray
           .sort(
             (a, b) =>
@@ -1202,61 +1400,423 @@ io.on("connection", (socket) => {
   socket.on(
     "pingDriver",
     safeHandler("pingDriver", (data) => {
+      // Validate user role before allowing ping
+      if (socket.role !== "user") {
+        const errorMsg = "Only users can ping drivers";
+        socket.emit("error", { message: errorMsg });
+        log(`❌ Socket ${socket.id} (role: ${socket.role || "unregistered"}) attempted to ping driver but is not registered as user`, "error");
+        return;
+      }
+
+      const userAccountId = socketToAccountId[socket.id];
+      const { driverAccountId, lat, lng, passengerCount, userAccountId: pingUserAccountId } = data || {};
+      const effectiveUserAccountId = pingUserAccountId || userAccountId || "unknown";
+
+      // Debug log to help diagnose ping issues
+      log(`🔍 [DEBUG] pingDriver received from ${socket.id}: ${JSON.stringify({ driverAccountId, lat, lng, passengerCount, userAccountId: pingUserAccountId })}`);
+
+      // Validate required fields
+      if (!driverAccountId || (typeof driverAccountId === "string" && driverAccountId.trim() === "")) {
+        const errorMsg = driverAccountId === undefined || driverAccountId === null 
+          ? "Missing driverAccountId" 
+          : "driverAccountId cannot be empty";
+        socket.emit("error", { message: errorMsg });
+        log(`❌ User ${effectiveUserAccountId} failed to ping driver: ${errorMsg}`, "error");
+        return;
+      }
+
+      if (lat === undefined || lng === undefined || lat === null || lng === null) {
+        const errorMsg = "Missing user location (lat, lng)";
+        socket.emit("error", { message: errorMsg });
+        log(`❌ User ${effectiveUserAccountId} failed to ping driver ${driverAccountId}: ${errorMsg}`, "error");
+        return;
+      }
+
+      // Validate and normalize coordinates
+      const userLat = typeof lat === "string" ? parseFloat(lat) : lat;
+      const userLng = typeof lng === "string" ? parseFloat(lng) : lng;
+      
+      if (typeof userLat !== "number" || isNaN(userLat) || userLat < -90 || userLat > 90) {
+        const errorMsg = "Invalid latitude";
+        socket.emit("error", { message: errorMsg });
+        log(`❌ User ${effectiveUserAccountId} failed to ping driver ${driverAccountId}: ${errorMsg}`, "error");
+        return;
+      }
+
+      if (typeof userLng !== "number" || isNaN(userLng) || userLng < -180 || userLng > 180) {
+        const errorMsg = "Invalid longitude";
+        socket.emit("error", { message: errorMsg });
+        log(`❌ User ${effectiveUserAccountId} failed to ping driver ${driverAccountId}: ${errorMsg}`, "error");
+        return;
+      }
+
+      // NOTE: This is the number of passengers the USER wants to board, NOT the driver's current passenger count
+      // This value is only sent to the driver for display/tracking purposes on the driver side
+      const MAX_BOARDING_PASSENGERS = 10; // Reasonable maximum for a single boarding request
+      let requestedPassengerCount = 1; // Default: 1 passenger wants to board
+      
+      if (passengerCount !== undefined && passengerCount !== null) {
+        const parsedCount = Number(passengerCount);
+        
+        // Check if it's a valid number
+        if (isNaN(parsedCount) || !isFinite(parsedCount)) {
+          const errorMsg = "Invalid passenger count: must be a number";
+          socket.emit("error", { message: errorMsg });
+          log(`❌ User ${effectiveUserAccountId} failed to ping driver ${driverAccountId}: ${errorMsg}`, "error");
+          return;
+        }
+        
+        // Convert to integer and validate range
+        const intCount = Math.floor(Math.abs(parsedCount));
+        
+        if (intCount < 1) {
+          const errorMsg = "Passenger count must be at least 1";
+          socket.emit("error", { message: errorMsg });
+          log(`❌ User ${effectiveUserAccountId} failed to ping driver ${driverAccountId}: ${errorMsg}`, "error");
+          return;
+        }
+        
+        if (intCount > MAX_BOARDING_PASSENGERS) {
+          const errorMsg = `Passenger count cannot exceed ${MAX_BOARDING_PASSENGERS}`;
+          socket.emit("error", { message: errorMsg });
+          log(`❌ User ${effectiveUserAccountId} failed to ping driver ${driverAccountId}: ${errorMsg}`, "error");
+          return;
+        }
+        
+        requestedPassengerCount = intCount;
+      }
+
+      // Check if driver exists
+      const driver = drivers[driverAccountId];
+      if (!driver) {
+        const errorMsg = "Driver not found";
+        socket.emit("error", { message: errorMsg });
+        log(`❌ User ${effectiveUserAccountId} failed to ping driver ${driverAccountId}: ${errorMsg}`, "error");
+        return;
+      }
+
+      // Get driver's socket ID (prefer accountIdToSocketId as source of truth)
+      const driverSocketId = accountIdToSocketId[driverAccountId];
+      if (!driverSocketId) {
+        const errorMsg = "Driver socket not found";
+        socket.emit("error", { message: errorMsg });
+        log(`❌ User ${effectiveUserAccountId} failed to ping driver ${driverAccountId}: ${errorMsg}`, "error");
+        return;
+      }
+
+      // Verify driver socket is actually connected (not just exists in mapping)
+      const driverSocket = io.sockets.sockets.get(driverSocketId);
+      if (!driverSocket || !driverSocket.connected || driver.disconnected) {
+        const errorMsg = "Driver is offline";
+        socket.emit("error", { message: errorMsg });
+        log(`❌ User ${effectiveUserAccountId} failed to ping driver ${driverAccountId}: ${errorMsg}`, "error");
+        return;
+      }
+
+      // Update user location and activity when pinging
+      if (userAccountId && users[userAccountId]) {
+        users[userAccountId].lat = userLat;
+        users[userAccountId].lng = userLng;
+        users[userAccountId].lastActivity = Date.now();
+      } else if (userAccountId) {
+        // Create user entry if it doesn't exist but accountId is available
+        users[userAccountId] = {
+          accountId: userAccountId,
+          socketId: socket.id,
+          lat: userLat,
+          lng: userLng,
+          lastActivity: Date.now(),
+          connectedAt: Date.now(),
+          disconnected: false,
+          disconnectedAt: null
+        };
+        socketToAccountId[socket.id] = userAccountId;
+        accountIdToSocketId[userAccountId] = socket.id;
+      }
+
+      // Track waiting passengers in driver object (for driver-side display only)
+      // NOTE: This passengerCount is the number the user wants to board, NOT the driver's current count
+      if (!driver.waitingPassengers) {
+        driver.waitingPassengers = {};
+      }
+      driver.waitingPassengers[effectiveUserAccountId] = {
+        userAccountId: effectiveUserAccountId,
+        lat: userLat,
+        lng: userLng,
+        passengerCount: requestedPassengerCount, // Number of passengers user wants to board
+        pingedAt: Date.now()
+      };
+      drivers[driverAccountId] = driver;
+
+      // Calculate total waiting passengers count (sum of all passenger counts from waiting users)
+      const totalWaitingPassengers = Object.values(driver.waitingPassengers).reduce((sum, passenger) => {
+        return sum + (passenger.passengerCount || 1);
+      }, 0);
+
+      // Send ping ONLY to the specific driver (not broadcasted)
+      // The passengerCount here is for driver-side display only - driver updates their own count separately
+      try {
+        driverSocket.emit("pingReceived", {
+          from: "user",
+          userAccountId: effectiveUserAccountId,
+          lat: userLat,
+          lng: userLng,
+          passengerCount: requestedPassengerCount, // Number of passengers user wants to board (for driver display only)
+          timestamp: Date.now(),
+        });
+
+        log(`✅ User ${effectiveUserAccountId} pinged driver ${driverAccountId} at (${userLat.toFixed(6)}, ${userLng.toFixed(6)}) - requesting to board ${requestedPassengerCount} passenger(s)`);
+        
+        // Broadcast updated waiting count and waiting users locations to all users viewing this driver
+        // This ensures other users see the waiting count update and locations in real-time
+        if (driver.lat && driver.lng) {
+          // Prepare waiting passengers list (only include locations, not sensitive data)
+          const waitingPassengersList = Object.values(driver.waitingPassengers).map(passenger => ({
+            userId: passenger.userAccountId || passenger.userId,
+            lat: passenger.lat,
+            lng: passenger.lng,
+            passengerCount: passenger.passengerCount || 1
+          }));
+
+          io.to("user").emit("locationUpdate", {
+            from: "driver",
+            accountId: driverAccountId,
+            lat: driver.lat,
+            lng: driver.lng,
+            geometry: driver.geometry, // Include route geometry to keep marker and polyline in sync
+            destinationName: driver.destinationName || "Unknown",
+            destinationLat: driver.destinationLat,
+            destinationLng: driver.destinationLng,
+            passengerCount: driver.passengerCount || 0,
+            maxCapacity: driver.maxCapacity || 0,
+            waitingUsersCount: totalWaitingPassengers, // Broadcast updated waiting count
+            waitingUsers: waitingPassengersList, // Broadcast waiting users locations
+            lastUpdated: driver.lastUpdated || new Date().toISOString(),
+            isOnline: !driver.disconnected,
+          });
+          log(`📢 Broadcasted waiting count update for driver ${driverAccountId}: ${totalWaitingPassengers} waiting passenger(s) at ${waitingPassengersList.length} location(s)`);
+        }
+      } catch (error) {
+        const errorMsg = `Failed to send ping: ${error.message}`;
+        socket.emit("error", { message: errorMsg });
+        log(`❌ User ${effectiveUserAccountId} failed to ping driver ${driverAccountId}: ${errorMsg}`, "error");
+      }
+    })
+  );
+
+  // --- USER REQUEST: Unping Driver ---
+  /**
+   * unpingDriver Event Handler
+   * 
+   * Users can unping a driver to remove their ping from the driver's map.
+   * This removes the ping marker that was previously sent to the driver.
+   * Only sent to the specific driver (not broadcasted to all drivers).
+   */
+  socket.on(
+    "unpingDriver",
+    safeHandler("unpingDriver", (data) => {
+      // Validate user role before allowing unping
+      if (socket.role !== "user") {
+        const errorMsg = "Only users can unping drivers";
+        socket.emit("error", { message: errorMsg });
+        log(`❌ Socket ${socket.id} (role: ${socket.role || "unregistered"}) attempted to unping driver but is not registered as user`, "error");
+        return;
+      }
+
       const userAccountId = socketToAccountId[socket.id];
       if (userAccountId && users[userAccountId]) {
         users[userAccountId].lastActivity = Date.now();
       }
 
-      const { driverAccountId, lat, lng, passengerCount, userAccountId: pingUserAccountId } = data || {};
+      const { driverAccountId, userAccountId: unpingUserAccountId } = data || {};
+      const effectiveUserAccountId = unpingUserAccountId || userAccountId || "unknown";
 
       // Validate required fields
       if (!driverAccountId) {
-        socket.emit("error", { message: "Missing driverAccountId" });
+        const errorMsg = "Missing driverAccountId";
+        socket.emit("error", { message: errorMsg });
+        log(`❌ User ${effectiveUserAccountId} failed to unping driver: ${errorMsg}`, "error");
         return;
       }
 
-      if (lat === undefined || lng === undefined || lat === null || lng === null) {
-        socket.emit("error", { message: "Missing user location (lat, lng)" });
-        return;
-      }
-
-      // Validate passenger count (default to 1 if not provided)
-      const validPassengerCount = passengerCount !== undefined && passengerCount !== null 
-        ? Math.max(1, Math.floor(Number(passengerCount))) 
-        : 1;
-
-      // Check if driver exists and is online
+      // Check if driver exists
       const driver = drivers[driverAccountId];
       if (!driver) {
-        socket.emit("error", { message: "Driver not found" });
+        const errorMsg = "Driver not found";
+        socket.emit("error", { message: errorMsg });
+        log(`❌ User ${effectiveUserAccountId} failed to unping driver ${driverAccountId}: ${errorMsg}`, "error");
         return;
       }
 
-      if (driver.disconnected || !driver.socketId) {
-        socket.emit("error", { message: "Driver is offline" });
-        return;
-      }
-
-      // Get driver's socket ID
-      const driverSocketId = accountIdToSocketId[driverAccountId] || driver.socketId;
+      // Get driver's socket ID (prefer accountIdToSocketId as source of truth)
+      const driverSocketId = accountIdToSocketId[driverAccountId];
       if (!driverSocketId) {
-        socket.emit("error", { message: "Driver socket not found" });
+        const errorMsg = "Driver socket not found";
+        socket.emit("error", { message: errorMsg });
+        log(`❌ User ${effectiveUserAccountId} failed to unping driver ${driverAccountId}: ${errorMsg}`, "error");
         return;
       }
 
-      // Send ping ONLY to the specific driver (not broadcasted)
-      io.to(driverSocketId).emit("pingReceived", {
-        from: "user",
-        userAccountId: pingUserAccountId || userAccountId || "unknown",
-        lat: lat,
-        lng: lng,
-        passengerCount: validPassengerCount,
-        timestamp: Date.now(),
-      });
+      // Verify driver socket is actually connected (not just exists in mapping)
+      const driverSocket = io.sockets.sockets.get(driverSocketId);
+      if (!driverSocket || !driverSocket.connected || driver.disconnected) {
+        const errorMsg = "Driver is offline";
+        socket.emit("error", { message: errorMsg });
+        log(`❌ User ${effectiveUserAccountId} failed to unping driver ${driverAccountId}: ${errorMsg}`, "error");
+        return;
+      }
 
-      log(
-        `📍 User ${userAccountId || socket.id} pinged driver ${driverAccountId} at (${lat}, ${lng}) with ${validPassengerCount} passenger(s)`
-      );
+      // Remove waiting passenger from driver's tracking
+      if (driver.waitingPassengers && driver.waitingPassengers[effectiveUserAccountId]) {
+        delete driver.waitingPassengers[effectiveUserAccountId];
+        drivers[driverAccountId] = driver;
+      }
+
+      // Calculate updated total waiting passengers count after unping
+      const totalWaitingPassengers = driver.waitingPassengers ? 
+        Object.values(driver.waitingPassengers).reduce((sum, passenger) => {
+          return sum + (passenger.passengerCount || 1);
+        }, 0) : 0;
+
+      // Send unping ONLY to the specific driver (not broadcasted)
+      try {
+        driverSocket.emit("pingRemoved", {
+          from: "user",
+          userAccountId: effectiveUserAccountId,
+          timestamp: Date.now(),
+        });
+
+        log(`✅ User ${effectiveUserAccountId} unpinged driver ${driverAccountId}`);
+        
+        // Broadcast updated waiting count and waiting users locations to all users viewing this driver
+        // This ensures other users see the waiting count update in real-time when someone unpinges
+        if (driver.lat && driver.lng) {
+          // Prepare waiting passengers list (only include locations, not sensitive data)
+          const waitingPassengersList = driver.waitingPassengers ? 
+            Object.values(driver.waitingPassengers).map(passenger => ({
+              userId: passenger.userAccountId || passenger.userId,
+              lat: passenger.lat,
+              lng: passenger.lng,
+              passengerCount: passenger.passengerCount || 1
+            })) : [];
+
+          io.to("user").emit("locationUpdate", {
+            from: "driver",
+            accountId: driverAccountId,
+            lat: driver.lat,
+            lng: driver.lng,
+            geometry: driver.geometry, // Include route geometry to keep marker and polyline in sync
+            destinationName: driver.destinationName || "Unknown",
+            destinationLat: driver.destinationLat,
+            destinationLng: driver.destinationLng,
+            passengerCount: driver.passengerCount || 0,
+            maxCapacity: driver.maxCapacity || 0,
+            waitingUsersCount: totalWaitingPassengers, // Broadcast updated waiting count
+            waitingUsers: waitingPassengersList, // Broadcast waiting users locations
+            lastUpdated: driver.lastUpdated || new Date().toISOString(),
+            isOnline: !driver.disconnected,
+          });
+          log(`📢 Broadcasted waiting count update for driver ${driverAccountId} after unping: ${totalWaitingPassengers} waiting passenger(s) at ${waitingPassengersList.length} location(s)`);
+        }
+      } catch (error) {
+        const errorMsg = `Failed to send unping: ${error.message}`;
+        socket.emit("error", { message: errorMsg });
+        log(`❌ User ${effectiveUserAccountId} failed to unping driver ${driverAccountId}: ${errorMsg}`, "error");
+      }
+    })
+  );
+
+  // --- END SESSION HANDLER (Driver-initiated cleanup) ---
+  /**
+   * endSession Event Handler
+   * Allows drivers to explicitly end their session, triggering immediate cleanup
+   * instead of waiting for the 5-minute stale timeout.
+   * 
+   * NOTE: This is a manual cleanup that happens immediately when the driver clicks "End Session".
+   * The automatic cleanup (cleanupStaleDrivers) still runs every 60 seconds for redundancy.
+   * If manual cleanup fails or misses something, the automatic cleanup will catch it.
+   * The automatic cleanup safely handles drivers that were already manually removed (no errors).
+   */
+  socket.on(
+    "endSession",
+    safeHandler("endSession", (data) => {
+      const accountId = socketToAccountId[socket.id];
+      
+      if (!accountId) {
+        log(`⚠️ endSession called but no accountId found for socket ${socket.id}`);
+        return;
+      }
+
+      if (socket.role !== "driver") {
+        log(`⚠️ endSession called by non-driver socket ${socket.id} (role: ${socket.role || "unknown"})`);
+        return;
+      }
+
+      const driver = drivers[accountId];
+      if (!driver) {
+        log(`⚠️ endSession called but driver ${accountId} not found in memory`);
+        return;
+      }
+
+
+      const waitingPassengerIds = driver.waitingPassengers ? Object.keys(driver.waitingPassengers) : [];
+
+      if (waitingPassengerIds.length > 0) {
+        log(`👥 Driver ${accountId} has ${waitingPassengerIds.length} waiting passenger(s) - notifying them before removal`);
+        
+        waitingPassengerIds.forEach((userId) => {
+          const userSocketId = accountIdToSocketId[userId];
+          if (userSocketId) {
+            const userSocket = io.sockets.sockets.get(userSocketId);
+            if (userSocket && userSocket.connected && users[userId] && !users[userId].disconnected) {
+              // Notify waiting user that driver ended session
+              userSocket.emit("error", {
+                message: "The driver you pinged has ended their session. Please select another driver.",
+                driverAccountId: accountId
+              });
+              log(`⚠️ Notified waiting user ${userId} that driver ${accountId} ended session`);
+            }
+          }
+        });
+      }
+
+      // Immediately remove driver from memory (no grace period)
+      delete drivers[accountId];
+      if (driver.socketId) {
+        delete socketToAccountId[driver.socketId];
+      }
+      delete accountIdToSocketId[accountId];
+      
+      // Clean up session mappings
+      const sessionKey = socketIdToSessionKey[socket.id];
+      if (sessionKey) {
+        if (sessionKeyToSocketId[sessionKey] === socket.id) {
+          delete sessionKeyToSocketId[sessionKey];
+        }
+        delete sessions[sessionKey];
+      }
+      delete socketIdToSessionKey[socket.id];
+      delete rateLimitMap[socket.id];
+      
+      // Remove from pending state restoration if present
+      pendingStateRestore.delete(accountId);
+
+      // Verify driver was removed and log confirmation
+      const driverRemoved = !drivers[accountId];
+      if (driverRemoved) {
+        log(`🗑️ [${accountId}] Driver session ended immediately (user-initiated, ${waitingPassengerIds.length} waiting users notified)`);
+        if (IS_DEV) {
+          console.log(`🧹 Cleaned up driver ${accountId} (manual endSession)`);
+        }
+      } else {
+        log(`⚠️ [${accountId}] Warning: Driver may not have been fully removed from drivers{}`, "error");
+      }
+      
+      // Notify all users that this driver is no longer available
+      io.to("user").emit("driverRemoved", {
+        accountId: accountId,
+        timestamp: Date.now()
+      });
     })
   );
 
